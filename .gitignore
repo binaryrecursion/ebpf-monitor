@@ -1,0 +1,17 @@
+/build
+/examples/c/build
+/examples/c/.xmake
+/.idea
+# build files
+*.o
+*.skel.h
+bootstrap
+
+# temp
+*.log
+
+# vscode (if any)
+.vscode/
+
+# system trash
+.DS_Store
