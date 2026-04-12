@@ -24,30 +24,24 @@ static struct syscall_stat *get_stat(const char *proc, const char *event, int pi
 
     struct syscall_stat *s = &stats[stat_count];
 
+    /* Zero the entire slot first so no field is ever uninitialised */
+    memset(s, 0, sizeof(*s));
+
     snprintf(s->process, sizeof(s->process), "%s", proc);
     snprintf(s->event,   sizeof(s->event),   "%s", event);
-    s->pid              = pid;
-
-    s->count            = 0;
-    s->total_latency    = 0;
-    s->max_latency      = 0;
-    s->ctx_switches     = 0;
-    s->rate             = 0.0;
-
-    s->baseline_latency = 0.0;
-    s->deviation        = 0.0;
-    s->is_anomaly       = 0;
-    s->baseline_ready   = 0;
+    s->pid = pid;
 
     stat_count++;
     return s;
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal: update EMA baseline and compute deviation                 */
+/* Internal: EMA baseline update + anomaly classification             */
 /*                                                                     */
-/*   EMA formula:  baseline = alpha * current + (1-alpha) * baseline  */
-/*   deviation  = |current_avg - baseline| / baseline                 */
+/*   On first sample  : seed baseline = current_avg                   */
+/*   On later samples : baseline = a*current + (1-a)*baseline        */
+/*   deviation        = |current_avg - baseline| / baseline           */
+/*   anomaly          : deviation > ANOMALY_THRESHOLD                 */
 /* ------------------------------------------------------------------ */
 
 static void update_baseline(struct syscall_stat *s)
@@ -58,7 +52,6 @@ static void update_baseline(struct syscall_stat *s)
     double current_avg = (double)s->total_latency / (double)s->count;
 
     if (!s->baseline_ready) {
-        /* Seed baseline with first observed average */
         s->baseline_latency = current_avg;
         s->baseline_ready   = 1;
         s->deviation        = 0.0;
@@ -66,17 +59,16 @@ static void update_baseline(struct syscall_stat *s)
         return;
     }
 
-    /* Exponential moving average update */
-    s->baseline_latency = BASELINE_ALPHA * current_avg +
-                          (1.0 - BASELINE_ALPHA) * s->baseline_latency;
+    /* Exponential moving average */
+    s->baseline_latency = BASELINE_ALPHA * current_avg
+                        + (1.0 - BASELINE_ALPHA) * s->baseline_latency;
 
-    /* Deviation relative to baseline */
-    if (s->baseline_latency > 0.0) {
-        s->deviation = fabs(current_avg - s->baseline_latency) /
-                       s->baseline_latency;
-    } else {
+    /* Relative deviation */
+    if (s->baseline_latency > 0.0)
+        s->deviation = fabs(current_avg - s->baseline_latency)
+                       / s->baseline_latency;
+    else
         s->deviation = 0.0;
-    }
 
     s->is_anomaly = (s->deviation > ANOMALY_THRESHOLD) ? 1 : 0;
 }
@@ -87,14 +79,15 @@ static void update_baseline(struct syscall_stat *s)
 
 void stats_update(const struct event *e)
 {
+    /* Drop events with no meaningful name */
     if (e->filename[0] == '\0')
         return;
 
-    /* Ignore the monitor process itself */
+    /* Ignore the monitor itself */
     if (strcmp(e->comm, "bootstrap") == 0)
         return;
 
-    /* ---------- PROCESS LIFECYCLE ---------- */
+    /* ---------- PROCESS LIFECYCLE (exit) ---------- */
     if (e->type == EVENT_EXIT) {
         struct syscall_stat *s = get_stat(e->comm, "lifecycle", e->pid);
         if (!s)
@@ -102,10 +95,10 @@ void stats_update(const struct event *e)
 
         s->pid = e->pid;
         s->count++;
-        s->total_latency += e->duration_ns;
+        s->total_latency += (long)e->duration_ns;
 
-        if (e->duration_ns > s->max_latency)
-            s->max_latency = e->duration_ns;
+        if ((long)e->duration_ns > s->max_latency)
+            s->max_latency = (long)e->duration_ns;
 
         update_baseline(s);
         return;
@@ -119,12 +112,12 @@ void stats_update(const struct event *e)
     if (!s)
         return;
 
-    s->pid = e->pid;   /* keep most recently seen PID */
+    s->pid = e->pid;
     s->count++;
-    s->total_latency += e->duration_ns;
+    s->total_latency += (long)e->duration_ns;
 
-    if (e->duration_ns > s->max_latency)
-        s->max_latency = e->duration_ns;
+    if ((long)e->duration_ns > s->max_latency)
+        s->max_latency = (long)e->duration_ns;
 
     if (e->type == EVENT_SCHED)
         s->ctx_switches++;
@@ -143,5 +136,7 @@ void stats_compute_rates(double elapsed)
 
 void stats_reset(void)
 {
+    /* Wipe all data including baselines so a reset is truly clean */
+    memset(stats, 0, sizeof(stats));
     stat_count = 0;
 }
