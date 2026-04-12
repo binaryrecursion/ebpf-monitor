@@ -16,186 +16,249 @@
 #include "stats.h"
 #include "dashboard.h"
 
+/* ------------------------------------------------------------------ */
+/* CLI argument state                                                  */
+/* ------------------------------------------------------------------ */
+
 static struct env {
-	bool verbose;
-	long min_duration_ms;
-} env;
+    bool verbose;
+    long min_duration_ms;
+} env = {
+    .verbose         = false,
+    .min_duration_ms = 0,
+};
 
-static volatile bool exiting = false;
-static time_t start_time;
+const char *argp_program_version     = "eBPF monitor 5.0";
+const char *argp_program_bug_address = "<your-email@example.com>";
 
-const char *argp_program_version = "eBPF monitor 5.0";
+static const char argp_doc[] =
+    "Kernel-level system performance monitor using eBPF.\n"
+    "\n"
+    "Traces syscalls, scheduling, and process lifecycle events\n"
+    "with adaptive baseline anomaly detection.\n";
 
-/* terminal state */
+static const struct argp_option argp_opts[] = {
+    { "verbose",     'v', NULL,   0, "Enable libbpf debug output",          0 },
+    { "min-dur",     'd', "MS",   0, "Minimum event duration to report (ms)", 0 },
+    { 0 }
+};
+
+static error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
+    switch (key) {
+    case 'v':
+        env.verbose = true;
+        break;
+    case 'd':
+        env.min_duration_ms = strtol(arg, NULL, 10);
+        break;
+    case ARGP_KEY_ARG:
+        argp_usage(state);
+        break;
+    default:
+        return ARGP_ERR_UNKNOWN;
+    }
+    return 0;
+}
+
+static const struct argp argp = {
+    .options  = argp_opts,
+    .parser   = parse_opt,
+    .doc      = argp_doc,
+};
+
+/* ------------------------------------------------------------------ */
+/* Globals                                                             */
+/* ------------------------------------------------------------------ */
+
+static volatile bool exiting    = false;
+static time_t        start_time;
+
+/* ------------------------------------------------------------------ */
+/* Terminal helpers                                                    */
+/* ------------------------------------------------------------------ */
+
 static struct termios orig_term;
 
-/* ---------------- terminal helpers ---------------- */
-
-static void reset_terminal()
+static void reset_terminal(void)
 {
-	// printf("\033[?1049l");   /* leave alternate screen */
-	tcsetattr(STDIN_FILENO, TCSANOW, &orig_term);
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_term);
 }
 
-static void setup_terminal()
+static void setup_terminal(void)
 {
-	struct termios newt;
+    struct termios newt;
 
-	tcgetattr(STDIN_FILENO, &orig_term);
-	newt = orig_term;
+    tcgetattr(STDIN_FILENO, &orig_term);
+    newt         = orig_term;
+    newt.c_lflag &= ~(ICANON | ECHO);
 
-	newt.c_lflag &= ~(ICANON | ECHO);
-
-	tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-	fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
-
-	// printf("\033[?1049h");   /* enter alternate screen */
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
 }
 
-static int read_key()
+static int read_key(void)
 {
-	char c;
+    char c;
 
-	if (read(STDIN_FILENO, &c, 1) == 1)
-		return c;
+    if (read(STDIN_FILENO, &c, 1) == 1)
+        return (unsigned char)c;
 
-	return -1;
+    return -1;
 }
 
-/* ---------------- libbpf logging ---------------- */
+/* ------------------------------------------------------------------ */
+/* libbpf logging                                                      */
+/* ------------------------------------------------------------------ */
 
 static int libbpf_print_fn(enum libbpf_print_level level,
-                           const char *format,
-                           va_list args)
+                            const char *format,
+                            va_list args)
 {
-	if (level == LIBBPF_DEBUG && !env.verbose)
-		return 0;
+    if (level == LIBBPF_DEBUG && !env.verbose)
+        return 0;
 
-	return vfprintf(stderr, format, args);
+    return vfprintf(stderr, format, args);
 }
 
-/* ---------------- signal handling ---------------- */
+/* ------------------------------------------------------------------ */
+/* Signal handler                                                      */
+/* ------------------------------------------------------------------ */
 
 static void sig_handler(int sig)
 {
-	exiting = true;
+    (void)sig;
+    exiting = true;
 }
 
-/* ---------------- ring buffer callback ---------------- */
+/* ------------------------------------------------------------------ */
+/* Ring buffer callback                                                */
+/* ------------------------------------------------------------------ */
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-	const struct event *e = data;
+    (void)ctx;
+    (void)data_sz;
 
-	stats_update(e);
+    const struct event *e = data;
 
-	return 0;
+    stats_update(e);
+
+    return 0;
 }
 
-/* ---------------- main ---------------- */
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
-	struct ring_buffer *rb = NULL;
-	struct bootstrap_bpf *skel;
-	int err;
+    struct ring_buffer  *rb   = NULL;
+    struct bootstrap_bpf *skel;
+    int err;
 
-	time_t last_print = time(NULL);
-	start_time = time(NULL);
+    time_t last_print;
+    start_time = time(NULL);
+    last_print  = start_time;
 
-	libbpf_set_print(libbpf_print_fn);
+    /* Parse CLI args */
+    err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
+    if (err)
+        return err;
 
-	signal(SIGINT, sig_handler);
-	signal(SIGTERM, sig_handler);
+    libbpf_set_print(libbpf_print_fn);
 
-	setup_terminal();
-	atexit(reset_terminal);
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
 
-	/* increase memlock limit */
-	struct rlimit rlim_new = {
-		.rlim_cur = RLIM_INFINITY,
-		.rlim_max = RLIM_INFINITY,
-	};
-	setrlimit(RLIMIT_MEMLOCK, &rlim_new);
+    setup_terminal();
+    atexit(reset_terminal);
 
-	/* open BPF program */
-	skel = bootstrap_bpf__open();
-	if (!skel) {
-		fprintf(stderr, "Failed to open BPF skeleton\n");
-		return 1;
-	}
+    /* Increase memlock limit so BPF maps can be allocated */
+    struct rlimit rlim_new = {
+        .rlim_cur = RLIM_INFINITY,
+        .rlim_max = RLIM_INFINITY,
+    };
+    setrlimit(RLIMIT_MEMLOCK, &rlim_new);
 
-	skel->rodata->min_duration_ns =
-	    env.min_duration_ms * 1000000ULL;
+    /* Open BPF skeleton */
+    skel = bootstrap_bpf__open();
+    if (!skel) {
+        fprintf(stderr, "Failed to open BPF skeleton\n");
+        return 1;
+    }
 
-	/* load BPF */
-	err = bootstrap_bpf__load(skel);
-	if (err) {
-		fprintf(stderr, "Failed to load BPF programs\n");
-		goto cleanup;
-	}
+    skel->rodata->min_duration_ns =
+        (unsigned long long)env.min_duration_ms * 1000000ULL;
 
-	/* attach BPF */
-	err = bootstrap_bpf__attach(skel);
-	if (err) {
-		fprintf(stderr, "Failed to attach BPF programs\n");
-		goto cleanup;
-	}
+    /* Load BPF programs into kernel */
+    err = bootstrap_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "Failed to load BPF programs\n");
+        goto cleanup;
+    }
 
-	/* create ring buffer */
-	rb = ring_buffer__new(
-	    bpf_map__fd(skel->maps.rb),
-	    handle_event,
-	    NULL,
-	    NULL);
+    /* Attach BPF programs to tracepoints */
+    err = bootstrap_bpf__attach(skel);
+    if (err) {
+        fprintf(stderr, "Failed to attach BPF programs\n");
+        goto cleanup;
+    }
 
-	if (!rb) {
-		fprintf(stderr, "Failed to create ring buffer\n");
-		goto cleanup;
-	}
+    /* Create ring buffer consumer */
+    rb = ring_buffer__new(
+        bpf_map__fd(skel->maps.rb),
+        handle_event,
+        NULL,
+        NULL);
 
-	while (!exiting) {
+    if (!rb) {
+        fprintf(stderr, "Failed to create ring buffer\n");
+        goto cleanup;
+    }
 
-		err = ring_buffer__poll(rb, 100);
+    /* ---- main event loop ---- */
+    while (!exiting) {
 
-		if (err == -EINTR)
-			break;
+        err = ring_buffer__poll(rb, 100 /* timeout ms */);
 
-		if (err < 0) {
-			fprintf(stderr,
-			        "Error polling ring buffer: %d\n",
-			        err);
-			break;
-		}
+        if (err == -EINTR)
+            break;
 
-		/* keyboard input */
-		int key = read_key();
+        if (err < 0) {
+            fprintf(stderr, "Error polling ring buffer: %d\n", err);
+            break;
+        }
 
-		if (key == 'q')
-			exiting = true;
+        /* Handle keyboard input */
+        int key = read_key();
 
-		if (key == 'r') {
-			stats_reset();
-			start_time = time(NULL);
-		}
+        if (key == 'q')
+            exiting = true;
 
-		time_t now = time(NULL);
+        if (key == 'r') {
+            stats_reset();
+            start_time = time(NULL);
+            last_print  = start_time;
+        }
 
-		if (now - last_print >= 2) {
+        /* Re-render every 2 seconds */
+        time_t now = time(NULL);
 
-			double elapsed = difftime(now, start_time);
+        if (now - last_print >= 2) {
 
-			stats_compute_rates(elapsed);
+            double elapsed = difftime(now, start_time);
 
-			dashboard_render(elapsed);
+            stats_compute_rates(elapsed);
+            dashboard_render(elapsed);
 
-			last_print = now;
-		}
-	}
+            last_print = now;
+        }
+    }
 
 cleanup:
-	ring_buffer__free(rb);
-	bootstrap_bpf__destroy(skel);
+    ring_buffer__free(rb);
+    bootstrap_bpf__destroy(skel);
 
-	return err < 0 ? -err : 0;
+    return err < 0 ? -err : 0;
 }

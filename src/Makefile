@@ -1,17 +1,17 @@
 CLANG ?= clang
-CC ?= gcc
+CC    ?= gcc
 
 ARCH := x86
 
 # paths
 LIBBPF_DIR := /usr
-INCLUDES := -I$(LIBBPF_DIR)/include -I$(LIBBPF_DIR)/include/bpf
+INCLUDES   := -I$(LIBBPF_DIR)/include -I$(LIBBPF_DIR)/include/bpf
 
 # flags
-CFLAGS := -O2 -g -Wall $(INCLUDES)
+CFLAGS     := -O2 -g -Wall -Wextra $(INCLUDES)
 BPF_CFLAGS := -O2 -g -target bpf
 
-LIBS := -L$(LIBBPF_DIR)/lib/x86_64-linux-gnu -lbpf -lelf -lz
+LIBS := -L$(LIBBPF_DIR)/lib/x86_64-linux-gnu -lbpf -lelf -lz -lm
 
 TARGET = bootstrap
 
@@ -33,7 +33,7 @@ dashboard.o: dashboard.c dashboard.h stats.h
 
 # ===================== BPF =====================
 
-bootstrap.bpf.o: bootstrap.bpf.c bootstrap.h
+bootstrap.bpf.o: bootstrap.bpf.c bootstrap.h vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) -D__TARGET_ARCH_$(ARCH) \
 		-c bootstrap.bpf.c -o bootstrap.bpf.o
 
