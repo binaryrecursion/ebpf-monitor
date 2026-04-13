@@ -3,7 +3,9 @@
 
 #include "stats.h"
 
-/* ---------- terminal colors ---------- */
+/* ------------------------------------------------------------------ */
+/* Terminal color codes                                                */
+/* ------------------------------------------------------------------ */
 
 #define COLOR_RESET   "\033[0m"
 #define COLOR_RED     "\033[31m"
@@ -14,30 +16,28 @@
 #define COLOR_BOLD    "\033[1m"
 #define COLOR_DIM     "\033[2m"
 
-/* Latency coloring: green < 10us, yellow < 100us, red >= 100us */
+/* Latency coloring thresholds (µs) */
+#define LATENCY_GREEN_US   10
+#define LATENCY_YELLOW_US 100
+
 static inline const char *latency_color(long us)
 {
-    if (us < 10)
-        return COLOR_GREEN;
-    else if (us < 100)
-        return COLOR_YELLOW;
-    else
-        return COLOR_RED;
+    if (us < LATENCY_GREEN_US)  return COLOR_GREEN;
+    if (us < LATENCY_YELLOW_US) return COLOR_YELLOW;
+    return COLOR_RED;
 }
 
-/* Deviation coloring for anomaly display */
 static inline const char *deviation_color(double dev)
 {
-    if (dev < 0.25)
-        return COLOR_GREEN;
-    else if (dev < ANOMALY_THRESHOLD)
-        return COLOR_YELLOW;
-    else
-        return COLOR_RED;
+    if (dev < 0.25)              return COLOR_GREEN;
+    if (dev < ANOMALY_THRESHOLD) return COLOR_YELLOW;
+    return COLOR_RED;
 }
 
-/* ---------- dashboard API ---------- */
+/* ------------------------------------------------------------------ */
+/* Dashboard API                                                       */
+/* ------------------------------------------------------------------ */
 
 void dashboard_render(double elapsed);
 
-#endif
+#endif /* DASHBOARD_H */

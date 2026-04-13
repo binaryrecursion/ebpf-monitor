@@ -8,8 +8,8 @@ LIBBPF_DIR := /usr
 INCLUDES   := -I$(LIBBPF_DIR)/include -I$(LIBBPF_DIR)/include/bpf
 
 # flags
-CFLAGS     := -O2 -g -Wall -Wextra $(INCLUDES)
-BPF_CFLAGS := -O2 -g -target bpf
+CFLAGS     := -O2 -g -Wall -Wextra -std=c11 $(INCLUDES)
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH)
 
 LIBS := -L$(LIBBPF_DIR)/lib/x86_64-linux-gnu -lbpf -lelf -lz -lm
 
@@ -34,7 +34,7 @@ dashboard.o: dashboard.c dashboard.h stats.h
 # ===================== BPF =====================
 
 bootstrap.bpf.o: bootstrap.bpf.c bootstrap.h vmlinux.h
-	$(CLANG) $(BPF_CFLAGS) -D__TARGET_ARCH_$(ARCH) \
+	$(CLANG) $(BPF_CFLAGS) \
 		-c bootstrap.bpf.c -o bootstrap.bpf.o
 
 bootstrap.skel.h: bootstrap.bpf.o

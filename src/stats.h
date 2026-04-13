@@ -3,33 +3,57 @@
 
 #include "bootstrap.h"
 
-#define MAX_STATS        256
-#define ANOMALY_THRESHOLD 0.5   /* 50% deviation from baseline triggers anomaly */
-#define BASELINE_ALPHA    0.2   /* EMA smoothing factor: 0=slow adapt, 1=no memory */
+/* ------------------------------------------------------------------ */
+/* Tunables                                                            */
+/* ------------------------------------------------------------------ */
+
+#define MAX_STATS         512   /* max unique (process, event) slots   */
+#define ANOMALY_THRESHOLD 0.5   /* 50% deviation triggers anomaly      */
+#define BASELINE_ALPHA    0.2   /* EMA smoothing: 0=slow, 1=no memory  */
+
+/* Sched delays > this value (ns) are almost certainly sleep/idle time,
+   not real scheduling latency.  We still record them for the lifecycle
+   view but exclude them from the anomaly / average computation.       */
+#define SCHED_NOISE_NS    (200ULL * 1000 * 1000)   /* 200 ms           */
+
+/* ------------------------------------------------------------------ */
+/* Per-(process, event) statistics                                     */
+/* ------------------------------------------------------------------ */
 
 struct syscall_stat {
     char process[16];
     char event[32];
-    int  pid;               /* PID of the process (last seen) */
+    int  pid;
 
-    long count;
-    long total_latency;
-    long max_latency;
-    long ctx_switches;
-    double rate;
+    long count;            /* total events seen                        */
+    long total_latency;    /* sum of durations (ns)                    */
+    long max_latency;      /* peak duration (ns)                       */
+    long ctx_switches;     /* incremented for EVENT_SCHED only         */
+    long exec_count;       /* incremented for EVENT_EXEC               */
+    long drop_count;       /* high-noise sched samples excluded        */
+    double rate;           /* events / second (recomputed each render) */
 
-    /* --- adaptive baseline fields --- */
-    double baseline_latency;  /* exponential moving average of avg latency (ns) */
-    double deviation;         /* |current_avg - baseline| / baseline */
-    int    is_anomaly;        /* 1 if deviation exceeds ANOMALY_THRESHOLD */
-    int    baseline_ready;    /* 1 after first sample has seeded the baseline */
+    /* --- adaptive baseline ----------------------------------------- */
+    double baseline_latency; /* EMA of average latency (ns)            */
+    double deviation;        /* |current_avg - baseline| / baseline    */
+    int    is_anomaly;       /* 1 if deviation > ANOMALY_THRESHOLD     */
+    int    baseline_ready;   /* 1 after first sample seeds baseline    */
 };
 
+/* ------------------------------------------------------------------ */
+/* Global state                                                        */
+/* ------------------------------------------------------------------ */
+
 extern struct syscall_stat stats[MAX_STATS];
-extern int stat_count;
+extern int  stat_count;
+extern long total_events_dropped;   /* events lost due to MAX_STATS    */
+
+/* ------------------------------------------------------------------ */
+/* API                                                                 */
+/* ------------------------------------------------------------------ */
 
 void stats_update(const struct event *e);
 void stats_compute_rates(double elapsed);
 void stats_reset(void);
 
-#endif
+#endif /* STATS_H */

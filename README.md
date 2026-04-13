@@ -2,7 +2,7 @@
 
 **Group 11 — Software Engineering Project**
 
-A kernel-level system performance monitoring tool built with eBPF. It traces system calls, CPU scheduling, and process lifecycle events in real time — without modifying the Linux kernel — and displays aggregated metrics with adaptive anomaly detection on a live CLI dashboard.
+A kernel-level system performance monitoring tool built with eBPF. Traces system calls, CPU scheduling, process exec/exit events in real time — without modifying the Linux kernel — and displays aggregated metrics with adaptive anomaly detection on a live CLI dashboard.
 
 ---
 
@@ -28,12 +28,11 @@ A kernel-level system performance monitoring tool built with eBPF. It traces sys
 │  Tracepoints:                                       │
 │  • sched_process_exec / sched_process_exit          │
 │  • sys_enter/exit_openat, read, write, close        │
-│  • sched_switch                                     │
-│                    │                               │
+│  • sched/sched_switch                               │
+│                    │                                │
 │              BPF Maps (Hash)                        │
-│          exec_start / syscall_start                 │
-│              sched_start                            │
-│                    │                               │
+│       exec_start / syscall_start / sched_start      │
+│                    │                                │
 │             Ring Buffer (256 KB)                    │
 └─────────────────────────────────────────────────────┘
                       │  events streamed via ring buffer
@@ -42,7 +41,7 @@ A kernel-level system performance monitoring tool built with eBPF. It traces sys
 │                                                     │
 │  bootstrap.c   — main loop, ring buffer consumer    │
 │  stats.c       — aggregation + EMA baseline         │
-│  dashboard.c   — CLI rendering (6 sections)         │
+│  dashboard.c   — CLI rendering (7 sections)         │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -108,33 +107,38 @@ sudo ./bootstrap --verbose
 | Key | Action |
 |---|---|
 | `q` | Quit |
-| `r` | Reset all stats and baseline |
+| `r` | Reset all stats and baselines (takes effect immediately) |
 
 ---
 
 ## Dashboard Sections
 
-The dashboard refreshes every 2 seconds and shows 6 sections:
+The dashboard refreshes every 2 seconds and shows 7 sections:
 
 ### 1. Main Table
-Per-process, per-event breakdown. Columns: `PROCESS`, `PID`, `EVENT`, `RATE/s`, `AVG(us)`, `MAX(us)`, `CTXSW`. Rows marked with `!` have an active anomaly.
+Per-process, per-event breakdown sorted by rate (highest first). Up to 12 rows shown. Columns: `PROCESS`, `PID`, `EVENT`, `RATE/s`, `AVG(us)`, `MAX(us)`, `CTXSW`, `EXECS`. Rows marked with `!` have an active anomaly.
 
-Latency colouring: green < 10 µs · yellow < 100 µs · red ≥ 100 µs.
+- Latency colouring: green < 10 µs · yellow < 100 µs · red ≥ 100 µs
+- `sched` AVG/MAX exclude off-CPU samples longer than 200 ms (sleep noise), so only true scheduling latency is averaged
+- A warning is shown if the slot table (default 512 entries) fills up
 
 ### 2. Event Summary
-All events aggregated across all processes. Shows average latency, max latency, and total event count per event type.
+All events aggregated across all processes. Shows average latency, max latency, total event count, and rate per event type.
 
-### 3. Top Events
-Event types ranked by total rate (events/second).
+### 3. Top Events By Rate
+Event types ranked by total events/second.
 
 ### 4. Slowest Events
 Per-process events ranked by maximum observed latency.
 
 ### 5. Activity Graph
-Horizontal bar chart of event types by aggregated rate. Each event type appears exactly once.
+Horizontal bar chart of event types by aggregated rate.
 
 ### 6. Adaptive Baseline — Anomaly Alerts
-Events whose current average latency has deviated more than 50% from their exponential moving average baseline. Shows deviation percentage, baseline value, and current value.
+Events whose current average latency has deviated more than 50% from their EMA baseline. Shows deviation %, baseline value, and current value.
+
+### 7. Process Lifecycle
+Summary of `exec` and `lifecycle` (exit) events per process, with average process lifetime.
 
 ---
 
@@ -146,17 +150,21 @@ Each `(process, event)` pair maintains a running baseline using an **exponential
 baseline = α × current_avg + (1 − α) × baseline
 ```
 
-where `α = 0.2` (configurable via `BASELINE_ALPHA` in `stats.h`).
+where `α = 0.2` (`BASELINE_ALPHA` in `stats.h`).
 
-Deviation is computed as:
+Deviation:
 
 ```
 deviation = |current_avg − baseline| / baseline
 ```
 
-If `deviation > 0.5` (50%), the entry is flagged as an anomaly. This threshold is configurable via `ANOMALY_THRESHOLD` in `stats.h`.
+If `deviation > 0.5` (50%), the entry is flagged. Threshold configurable via `ANOMALY_THRESHOLD`.
 
-The first observation seeds the baseline. Subsequent observations update it. Pressing `r` resets all baselines.
+---
+
+## Sched Noise Filtering
+
+The `sched_switch` tracepoint measures time a process spent **off-CPU** between two scheduling events. When a process is sleeping (e.g. `select`, `epoll_wait`), this time can be seconds long — this is not scheduling latency. Events with off-CPU time > 200 ms (`SCHED_NOISE_NS`) are counted toward the rate but excluded from the latency average and baseline. The threshold is configurable in `stats.h`.
 
 ---
 
@@ -168,7 +176,8 @@ The first observation seeds the baseline. Subsequent observations update it. Pre
 | `read` | `sys_enter/exit_read` | Read syscall latency |
 | `write` | `sys_enter/exit_write` | Write syscall latency |
 | `close` | `sys_enter/exit_close` | Close syscall latency |
-| `sched` | `sched/sched_switch` | CPU scheduling delay (time process waited to be scheduled) |
+| `sched` | `sched/sched_switch` | CPU scheduling delay (time process waited off-CPU, noise-filtered) |
+| `exec` | `sched_process_exec` | Process exec events (count only) |
 | `lifecycle` | `sched_process_exit` | Process total runtime (exec → exit) |
 
 ---
@@ -180,9 +189,9 @@ src/
 ├── bootstrap.bpf.c      BPF kernel programs (tracepoint handlers)
 ├── bootstrap.c          User-space main loop, libbpf wiring, CLI args
 ├── bootstrap.h          Shared event struct and event_type enum
-├── stats.c              Aggregation, EMA baseline, anomaly detection
-├── stats.h              syscall_stat struct, constants, API
-├── dashboard.c          CLI rendering (6 dashboard sections)
+├── stats.c              Aggregation, EMA baseline, anomaly detection, noise filtering
+├── stats.h              syscall_stat struct, constants (MAX_STATS=512), API
+├── dashboard.c          CLI rendering (7 dashboard sections)
 ├── dashboard.h          Color macros, latency_color, deviation_color
 ├── vmlinux.h            Kernel type definitions (CO-RE)
 ├── bootstrap.skel.h     Auto-generated BPF skeleton (do not edit)
@@ -193,19 +202,25 @@ src/
 
 ## Design Decisions
 
-**CO-RE (Compile Once, Run Everywhere):** The BPF programs use `BPF_CORE_READ()` from `bpf_core_read.h` and `vmlinux.h` for kernel struct access. This means the binary works across kernel versions without recompilation.
+**CO-RE (Compile Once, Run Everywhere):** Uses `BPF_CORE_READ()` and `vmlinux.h` for portability across kernel versions without recompilation.
 
-**Ring buffer over perf buffer:** `BPF_MAP_TYPE_RINGBUF` is used instead of the older perf buffer API. It has lower overhead and guarantees ordering within a single CPU.
+**Ring buffer over perf buffer:** `BPF_MAP_TYPE_RINGBUF` gives lower overhead and ordering guarantees.
 
-**EMA over simple average:** A simple running average would slowly incorporate all historical data equally. EMA weights recent observations more heavily, making the baseline adapt to genuine long-term shifts while still detecting short-term spikes.
+**EMA over simple average:** Weights recent observations more heavily, adapting to genuine long-term shifts while detecting short-term spikes.
 
-**Per-(process, event) baseline:** Each unique `(comm, filename)` pair has its own independent baseline. This prevents a slow process from masking a fast one being anomalous.
+**Per-(process, event) baseline:** Each unique `(comm, filename)` pair has its own independent baseline.
+
+**Sched noise filtering:** Off-CPU times > 200 ms are excluded from latency averages. A sleeping process is not experiencing scheduling latency — it intentionally yielded the CPU.
+
+**MAX_STATS = 512:** Doubled from 256 to reduce slot exhaustion in busy systems. When full, new slots are dropped and a visible warning is shown in the header and main table.
+
+**Exec tracking:** `EVENT_EXEC` events are now counted in a dedicated `exec` slot, populating the `EXECS` column and the Process Lifecycle section.
 
 ---
 
 ## Known Limitations
 
-- Process names are truncated to 15 characters (kernel `TASK_COMM_LEN` limit).
-- If more than 256 unique `(process, event)` pairs are seen, new ones are silently dropped (`MAX_STATS` limit).
-- The `ppid` field is populated for exec/exit events only; syscall and sched events do not carry a parent PID.
-- Context switch count (`CTXSW`) is only incremented for `sched` events, not for voluntary yields.
+- Process names truncated to 15 characters (kernel `TASK_COMM_LEN`).
+- If more than 512 unique `(process, event)` pairs are observed, new ones are dropped with a visible warning. Press `r` to reset.
+- `ppid` is populated for exec/exit events only.
+- `CTXSW` counts scheduling events; it is not the kernel's voluntary context switch counter.
