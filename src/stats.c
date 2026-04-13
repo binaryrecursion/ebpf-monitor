@@ -5,12 +5,12 @@
 #include "stats.h"
 
 struct syscall_stat stats[MAX_STATS];
-int  stat_count          = 0;
+int  stat_count           = 0;
 long total_events_dropped = 0;
 
 /* ------------------------------------------------------------------ */
 /* Internal: find or create a stat slot for (process, event) pair     */
-/* Returns NULL if the table is full (event is counted as dropped).   */
+/* Returns NULL if table is full (event counted as dropped).          */
 /* ------------------------------------------------------------------ */
 
 static struct syscall_stat *get_stat(const char *proc,
@@ -38,12 +38,60 @@ static struct syscall_stat *get_stat(const char *proc,
 }
 
 /* ------------------------------------------------------------------ */
-/* Internal: EMA baseline update + anomaly classification             */
+/* Internal: record a latency sample into the histogram               */
+/* ------------------------------------------------------------------ */
+
+static void hist_record(struct syscall_stat *s, long ns)
+{
+    long us = ns / 1000;
+    for (int b = 0; b < LAT_BUCKETS; b++) {
+        if (us < lat_bucket_us[b]) {
+            s->lat_hist[b]++;
+            return;
+        }
+    }
+    s->lat_hist[LAT_BUCKETS - 1]++;
+}
+
+/* ------------------------------------------------------------------ */
+/* Public: approximate P95 latency in microseconds                    */
 /*                                                                     */
-/*  First sample  → seed baseline = current_avg                       */
-/*  Later samples → baseline = α·current + (1-α)·baseline            */
-/*  deviation     = |current_avg − baseline| / baseline               */
-/*  anomaly       → deviation > ANOMALY_THRESHOLD                     */
+/* Interpolates within the bucket that contains the 95th percentile   */
+/* sample.  Returns -1 if there are fewer than 20 samples (P95 is     */
+/* not meaningful on tiny sample sizes).                               */
+/* ------------------------------------------------------------------ */
+
+long stats_p95_us(const struct syscall_stat *s)
+{
+    long valid = s->count - s->drop_count;
+    if (valid < 20)
+        return -1;
+
+    long max_us = s->max_latency / 1000;
+    long target  = (long)(valid * 0.95);
+    long cumul   = 0;
+
+    for (int b = 0; b < LAT_BUCKETS; b++) {
+        cumul += s->lat_hist[b];
+        if (cumul >= target) {
+            long edge = lat_bucket_us[b] == (long)9e18
+                        ? max_us
+                        : lat_bucket_us[b];
+            /*
+             * Cap at max_latency: the bucket upper edge can exceed the
+             * actual observed maximum when all samples in this bucket
+             * happen to be well below the edge (e.g. all samples are
+             * 8ms but the bucket goes up to 10ms).  P95 must never
+             * exceed the real maximum latency.
+             */
+            return edge < max_us ? edge : max_us;
+        }
+    }
+    return max_us;
+}
+
+/* ------------------------------------------------------------------ */
+/* Internal: EMA baseline update + anomaly classification             */
 /* ------------------------------------------------------------------ */
 
 static void update_baseline(struct syscall_stat *s)
@@ -51,7 +99,12 @@ static void update_baseline(struct syscall_stat *s)
     if (s->count == 0)
         return;
 
-    double current_avg = (double)s->total_latency / (double)s->count;
+    /* Use valid (non-noise) sample count for average */
+    long valid = s->count - s->drop_count;
+    if (valid <= 0 || s->total_latency <= 0)
+        return;
+
+    double current_avg = (double)s->total_latency / (double)valid;
 
     if (!s->baseline_ready) {
         s->baseline_latency = current_avg;
@@ -94,7 +147,6 @@ void stats_update(const struct event *e)
         s->pid = e->pid;
         s->exec_count++;
         s->count++;
-        /* exec has duration_ns = 0; don't skew latency averages */
         update_baseline(s);
         return;
     }
@@ -105,9 +157,12 @@ void stats_update(const struct event *e)
         if (!s) return;
         s->pid = e->pid;
         s->count++;
-        s->total_latency += (long)e->duration_ns;
-        if ((long)e->duration_ns > s->max_latency)
-            s->max_latency = (long)e->duration_ns;
+        if ((long)e->duration_ns > 0) {
+            s->total_latency += (long)e->duration_ns;
+            if ((long)e->duration_ns > s->max_latency)
+                s->max_latency = (long)e->duration_ns;
+            hist_record(s, (long)e->duration_ns);
+        }
         update_baseline(s);
         return;
     }
@@ -121,6 +176,7 @@ void stats_update(const struct event *e)
         s->total_latency += (long)e->duration_ns;
         if ((long)e->duration_ns > s->max_latency)
             s->max_latency = (long)e->duration_ns;
+        hist_record(s, (long)e->duration_ns);
         update_baseline(s);
         return;
     }
@@ -132,12 +188,13 @@ void stats_update(const struct event *e)
         s->pid = e->pid;
         s->ctx_switches++;
 
-        /* Filter out noise: very long off-CPU times are usually sleep,
-           not scheduling latency.  Count them separately but don't
-           include them in the latency average or baseline.           */
+        /*
+         * Filter out noise: off-CPU > 200ms is almost certainly sleep,
+         * not scheduling latency.  Count for rate, but exclude from
+         * latency average, histogram, and anomaly baseline.
+         */
         if (e->duration_ns > SCHED_NOISE_NS) {
             s->drop_count++;
-            /* Still update count so rate is accurate */
             s->count++;
             return;
         }
@@ -146,6 +203,7 @@ void stats_update(const struct event *e)
         s->total_latency += (long)e->duration_ns;
         if ((long)e->duration_ns > s->max_latency)
             s->max_latency = (long)e->duration_ns;
+        hist_record(s, (long)e->duration_ns);
         update_baseline(s);
         return;
     }

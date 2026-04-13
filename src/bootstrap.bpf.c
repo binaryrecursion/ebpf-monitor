@@ -37,19 +37,44 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
 
+/* ------------------------------------------------------------------ */
+/* Rodata: tunable constants set from user space before load          */
+/* ------------------------------------------------------------------ */
+
 const volatile unsigned long long min_duration_ns = 0;
+
+/* Filter by PID: 0 = trace all */
+const volatile int target_pid = 0;
+
+/* Filter by comm name: empty string = trace all */
+const volatile char target_comm[TASK_COMM_LEN] = {};
 
 /* ------------------------------------------------------------------ */
 /* Process filter                                                      */
-/* Uncomment the body to restrict tracing to specific commands.       */
+/* Returns 1 if the current process should be traced, 0 to skip.     */
 /* ------------------------------------------------------------------ */
 
 static __always_inline int allow_process(void)
 {
-	// char comm[16];
-	// bpf_get_current_comm(&comm, sizeof(comm));
-	// if (bpf_strncmp(comm, 16, "myapp") != 0)
-	//     return 0;
+	u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+	/* PID filter */
+	if (target_pid != 0 && (int)pid != target_pid)
+		return 0;
+
+	/* Comm filter */
+	if (target_comm[0] != '\0') {
+		char comm[TASK_COMM_LEN];
+		bpf_get_current_comm(&comm, sizeof(comm));
+		/* Manual strcmp — BPF verifier requires bounded loops */
+		for (int i = 0; i < TASK_COMM_LEN; i++) {
+			if (comm[i] != target_comm[i])
+				return 0;
+			if (comm[i] == '\0')
+				break;
+		}
+	}
+
 	return 1;
 }
 
@@ -117,8 +142,6 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 	if (!allow_process())
 		return 0;
 
-	/* Only handle the group leader exit to avoid duplicate events
-	   from per-thread exits in multi-threaded processes */
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	u32 tgid     = pid_tgid >> 32;
 	u32 tid      = (u32)pid_tgid;
@@ -132,7 +155,6 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 
 	bpf_map_delete_elem(&exec_start, &pid);
 
-	/* Apply minimum duration filter */
 	if (min_duration_ns && duration_ns < min_duration_ns)
 		return 0;
 
@@ -146,8 +168,6 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 	e->duration_ns = duration_ns;
 	e->type        = EVENT_EXIT;
 
-	/* Read exit code from task_struct via CO-RE.
-	   Kernel stores it as (signal << 8 | exit_code); we extract the code. */
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	unsigned int raw_exit    = BPF_CORE_READ(task, exit_code);
 	e->exit_code             = (raw_exit >> 8) & 0xff;
@@ -166,8 +186,7 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_sys_enter_openat(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!allow_process())
-		return 0;
+	if (!allow_process()) return 0;
 	u64 id = bpf_get_current_pid_tgid();
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&syscall_start, &id, &ts, BPF_ANY);
@@ -177,33 +196,20 @@ int handle_sys_enter_openat(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_exit_openat")
 int handle_sys_exit_openat(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!allow_process())
-		return 0;
-
-	u64 id       = bpf_get_current_pid_tgid();
+	if (!allow_process()) return 0;
+	u64 id        = bpf_get_current_pid_tgid();
 	u64 *start_ts = bpf_map_lookup_elem(&syscall_start, &id);
-	if (!start_ts)
-		return 0;
-
+	if (!start_ts) return 0;
 	u64 delta = bpf_ktime_get_ns() - *start_ts;
 	bpf_map_delete_elem(&syscall_start, &id);
-
-	if (min_duration_ns && delta < min_duration_ns)
-		return 0;
-
+	if (min_duration_ns && delta < min_duration_ns) return 0;
 	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	e->type        = EVENT_SYSCALL;
-	e->exit_event  = false;
-	e->pid         = (u32)(id >> 32);
-	e->ppid        = 0;
-	e->exit_code   = 0;
+	if (!e) return 0;
+	e->type = EVENT_SYSCALL; e->exit_event = false;
+	e->pid = (u32)(id >> 32); e->ppid = 0; e->exit_code = 0;
 	e->duration_ns = delta;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	__builtin_memcpy(e->filename, "openat", 7);
-
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -215,8 +221,7 @@ int handle_sys_exit_openat(struct trace_event_raw_sys_exit *ctx)
 SEC("tracepoint/syscalls/sys_enter_read")
 int handle_sys_enter_read(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!allow_process())
-		return 0;
+	if (!allow_process()) return 0;
 	u64 id = bpf_get_current_pid_tgid();
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&syscall_start, &id, &ts, BPF_ANY);
@@ -226,33 +231,20 @@ int handle_sys_enter_read(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_exit_read")
 int handle_sys_exit_read(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!allow_process())
-		return 0;
-
+	if (!allow_process()) return 0;
 	u64 id        = bpf_get_current_pid_tgid();
 	u64 *start_ts = bpf_map_lookup_elem(&syscall_start, &id);
-	if (!start_ts)
-		return 0;
-
+	if (!start_ts) return 0;
 	u64 delta = bpf_ktime_get_ns() - *start_ts;
 	bpf_map_delete_elem(&syscall_start, &id);
-
-	if (min_duration_ns && delta < min_duration_ns)
-		return 0;
-
+	if (min_duration_ns && delta < min_duration_ns) return 0;
 	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	e->type        = EVENT_SYSCALL;
-	e->exit_event  = false;
-	e->pid         = (u32)(id >> 32);
-	e->ppid        = 0;
-	e->exit_code   = 0;
+	if (!e) return 0;
+	e->type = EVENT_SYSCALL; e->exit_event = false;
+	e->pid = (u32)(id >> 32); e->ppid = 0; e->exit_code = 0;
 	e->duration_ns = delta;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	__builtin_memcpy(e->filename, "read", 5);
-
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -264,8 +256,7 @@ int handle_sys_exit_read(struct trace_event_raw_sys_exit *ctx)
 SEC("tracepoint/syscalls/sys_enter_write")
 int handle_sys_enter_write(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!allow_process())
-		return 0;
+	if (!allow_process()) return 0;
 	u64 id = bpf_get_current_pid_tgid();
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&syscall_start, &id, &ts, BPF_ANY);
@@ -275,33 +266,20 @@ int handle_sys_enter_write(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_exit_write")
 int handle_sys_exit_write(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!allow_process())
-		return 0;
-
+	if (!allow_process()) return 0;
 	u64 id        = bpf_get_current_pid_tgid();
 	u64 *start_ts = bpf_map_lookup_elem(&syscall_start, &id);
-	if (!start_ts)
-		return 0;
-
+	if (!start_ts) return 0;
 	u64 delta = bpf_ktime_get_ns() - *start_ts;
 	bpf_map_delete_elem(&syscall_start, &id);
-
-	if (min_duration_ns && delta < min_duration_ns)
-		return 0;
-
+	if (min_duration_ns && delta < min_duration_ns) return 0;
 	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	e->type        = EVENT_SYSCALL;
-	e->exit_event  = false;
-	e->pid         = (u32)(id >> 32);
-	e->ppid        = 0;
-	e->exit_code   = 0;
+	if (!e) return 0;
+	e->type = EVENT_SYSCALL; e->exit_event = false;
+	e->pid = (u32)(id >> 32); e->ppid = 0; e->exit_code = 0;
 	e->duration_ns = delta;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	__builtin_memcpy(e->filename, "write", 6);
-
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -313,8 +291,7 @@ int handle_sys_exit_write(struct trace_event_raw_sys_exit *ctx)
 SEC("tracepoint/syscalls/sys_enter_close")
 int handle_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
 {
-	if (!allow_process())
-		return 0;
+	if (!allow_process()) return 0;
 	u64 id = bpf_get_current_pid_tgid();
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&syscall_start, &id, &ts, BPF_ANY);
@@ -324,47 +301,61 @@ int handle_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_exit_close")
 int handle_sys_exit_close(struct trace_event_raw_sys_exit *ctx)
 {
-	if (!allow_process())
-		return 0;
-
+	if (!allow_process()) return 0;
 	u64 id        = bpf_get_current_pid_tgid();
 	u64 *start_ts = bpf_map_lookup_elem(&syscall_start, &id);
-	if (!start_ts)
-		return 0;
-
+	if (!start_ts) return 0;
 	u64 delta = bpf_ktime_get_ns() - *start_ts;
 	bpf_map_delete_elem(&syscall_start, &id);
-
-	if (min_duration_ns && delta < min_duration_ns)
-		return 0;
-
+	if (min_duration_ns && delta < min_duration_ns) return 0;
 	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-	if (!e)
-		return 0;
-
-	e->type        = EVENT_SYSCALL;
-	e->exit_event  = false;
-	e->pid         = (u32)(id >> 32);
-	e->ppid        = 0;
-	e->exit_code   = 0;
+	if (!e) return 0;
+	e->type = EVENT_SYSCALL; e->exit_event = false;
+	e->pid = (u32)(id >> 32); e->ppid = 0; e->exit_code = 0;
 	e->duration_ns = delta;
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	__builtin_memcpy(e->filename, "close", 6);
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
 
+/* ------------------------------------------------------------------ */
+/* mmap latency                                                        */
+/* ------------------------------------------------------------------ */
+
+SEC("tracepoint/syscalls/sys_enter_mmap")
+int handle_sys_enter_mmap(struct trace_event_raw_sys_enter *ctx)
+{
+	if (!allow_process()) return 0;
+	u64 id = bpf_get_current_pid_tgid();
+	u64 ts = bpf_ktime_get_ns();
+	bpf_map_update_elem(&syscall_start, &id, &ts, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_mmap")
+int handle_sys_exit_mmap(struct trace_event_raw_sys_exit *ctx)
+{
+	if (!allow_process()) return 0;
+	u64 id        = bpf_get_current_pid_tgid();
+	u64 *start_ts = bpf_map_lookup_elem(&syscall_start, &id);
+	if (!start_ts) return 0;
+	u64 delta = bpf_ktime_get_ns() - *start_ts;
+	bpf_map_delete_elem(&syscall_start, &id);
+	if (min_duration_ns && delta < min_duration_ns) return 0;
+	struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+	if (!e) return 0;
+	e->type = EVENT_SYSCALL; e->exit_event = false;
+	e->pid = (u32)(id >> 32); e->ppid = 0; e->exit_code = 0;
+	e->duration_ns = delta;
+	bpf_get_current_comm(&e->comm, sizeof(e->comm));
+	__builtin_memcpy(e->filename, "mmap", 5);
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 
 /* ------------------------------------------------------------------ */
 /* CPU scheduling delay                                               */
-/*                                                                    */
-/* On each sched_switch we record when next_pid was scheduled in.    */
-/* On the FOLLOWING switch where this pid is prev_pid (scheduled out),*/
-/* we use sched_start to compute how long it ran — but here we track  */
-/* the INVERSE: how long was it WAITING (off-CPU time).              */
-/*                                                                    */
-/* When next_pid comes back onto the CPU, delta = now - last_off      */
-/* gives the scheduling delay (time the process was waiting).        */
 /* ------------------------------------------------------------------ */
 
 SEC("tracepoint/sched/sched_switch")
@@ -373,36 +364,48 @@ int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 	u32 next_pid = ctx->next_pid;
 	u64 ts       = bpf_ktime_get_ns();
 
-	/* Skip idle thread (pid 0) */
 	if (next_pid == 0)
 		return 0;
 
 	char comm[16];
 	bpf_probe_read_kernel_str(comm, sizeof(comm), ctx->next_comm);
 
-	u64 *start_ts = bpf_map_lookup_elem(&sched_start, &next_pid);
+	/* Apply comm filter for sched events */
+	if (target_comm[0] != '\0') {
+		for (int i = 0; i < TASK_COMM_LEN; i++) {
+			if (comm[i] != target_comm[i])
+				goto skip_next;
+			if (comm[i] == '\0')
+				break;
+		}
+	}
 
-	if (start_ts) {
-		u64 delta = ts - *start_ts;
+	/* Apply PID filter */
+	if (target_pid != 0 && (int)next_pid != target_pid)
+		goto skip_next;
 
-		if (!min_duration_ns || delta >= min_duration_ns) {
-			struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-			if (e) {
-				e->type        = EVENT_SCHED;
-				e->exit_event  = false;
-				e->pid         = next_pid;
-				e->ppid        = 0;
-				e->exit_code   = 0;
-				e->duration_ns = delta;
-				__builtin_memcpy(e->comm, comm, sizeof(comm));
-				__builtin_memcpy(e->filename, "sched", 6);
-				bpf_ringbuf_submit(e, 0);
+	{
+		u64 *start_ts = bpf_map_lookup_elem(&sched_start, &next_pid);
+		if (start_ts) {
+			u64 delta = ts - *start_ts;
+			if (!min_duration_ns || delta >= min_duration_ns) {
+				struct event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+				if (e) {
+					e->type        = EVENT_SCHED;
+					e->exit_event  = false;
+					e->pid         = next_pid;
+					e->ppid        = 0;
+					e->exit_code   = 0;
+					e->duration_ns = delta;
+					__builtin_memcpy(e->comm, comm, sizeof(comm));
+					__builtin_memcpy(e->filename, "sched", 6);
+					bpf_ringbuf_submit(e, 0);
+				}
 			}
 		}
 	}
 
-	/* Record when this process was last scheduled OFF the CPU.
-	   We use prev_pid for the "scheduled out" timestamp. */
+skip_next:;
 	u32 prev_pid = ctx->prev_pid;
 	if (prev_pid != 0)
 		bpf_map_update_elem(&sched_start, &prev_pid, &ts, BPF_ANY);

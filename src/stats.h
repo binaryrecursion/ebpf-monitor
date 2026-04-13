@@ -11,10 +11,22 @@
 #define ANOMALY_THRESHOLD 0.5   /* 50% deviation triggers anomaly      */
 #define BASELINE_ALPHA    0.2   /* EMA smoothing: 0=slow, 1=no memory  */
 
-/* Sched delays > this value (ns) are almost certainly sleep/idle time,
-   not real scheduling latency.  We still record them for the lifecycle
-   view but exclude them from the anomaly / average computation.       */
+/* Sched delays > this (ns) are almost certainly sleep/idle, not real
+   scheduling latency.  Still counted for rate but excluded from the
+   latency average, max, and anomaly baseline.                         */
 #define SCHED_NOISE_NS    (200ULL * 1000 * 1000)   /* 200 ms           */
+
+/*
+ * Simple latency histogram for approximate P95 calculation.
+ * Buckets (in microseconds, upper edge):
+ *   [0]  0–9 us        [1]  10–49 us       [2]  50–99 us
+ *   [3]  100–499 us    [4]  500–999 us      [5]  1000–4999 us
+ *   [6]  5000–9999 us  [7]  >= 10000 us
+ */
+#define LAT_BUCKETS 8
+static const long lat_bucket_us[LAT_BUCKETS] = {
+    10, 50, 100, 500, 1000, 5000, 10000, (long)9e18
+};
 
 /* ------------------------------------------------------------------ */
 /* Per-(process, event) statistics                                     */
@@ -33,6 +45,9 @@ struct syscall_stat {
     long drop_count;       /* high-noise sched samples excluded        */
     double rate;           /* events / second (recomputed each render) */
 
+    /* Histogram for P95 approximation (counts per latency bucket) */
+    long lat_hist[LAT_BUCKETS];
+
     /* --- adaptive baseline ----------------------------------------- */
     double baseline_latency; /* EMA of average latency (ns)            */
     double deviation;        /* |current_avg - baseline| / baseline    */
@@ -46,14 +61,15 @@ struct syscall_stat {
 
 extern struct syscall_stat stats[MAX_STATS];
 extern int  stat_count;
-extern long total_events_dropped;   /* events lost due to MAX_STATS    */
+extern long total_events_dropped;
 
 /* ------------------------------------------------------------------ */
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
-void stats_update(const struct event *e);
-void stats_compute_rates(double elapsed);
-void stats_reset(void);
+void  stats_update(const struct event *e);
+void  stats_compute_rates(double elapsed);
+void  stats_reset(void);
+long  stats_p95_us(const struct syscall_stat *s);
 
 #endif /* STATS_H */

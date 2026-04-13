@@ -1,13 +1,21 @@
 CLANG ?= clang
 CC    ?= gcc
 
-ARCH := x86
+# Auto-detect architecture; override with: make ARCH=arm64
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+    ARCH := x86
+else ifeq ($(UNAME_M),aarch64)
+    ARCH := arm64
+else ifeq ($(UNAME_M),arm)
+    ARCH := arm
+else
+    ARCH := $(UNAME_M)
+endif
 
-# paths
 LIBBPF_DIR := /usr
 INCLUDES   := -I$(LIBBPF_DIR)/include -I$(LIBBPF_DIR)/include/bpf
 
-# flags
 CFLAGS     := -O2 -g -Wall -Wextra -std=c11 $(INCLUDES)
 BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH)
 
@@ -19,10 +27,10 @@ TARGET = bootstrap
 
 all: $(TARGET)
 
-$(TARGET): bootstrap.o stats.o dashboard.o bootstrap.skel.h
-	$(CC) $(CFLAGS) -o $@ bootstrap.o stats.o dashboard.o $(LIBS)
+$(TARGET): bootstrap.o stats.o dashboard.o export.o bootstrap.skel.h
+	$(CC) $(CFLAGS) -o $@ bootstrap.o stats.o dashboard.o export.o $(LIBS)
 
-bootstrap.o: bootstrap.c bootstrap.h stats.h dashboard.h bootstrap.skel.h
+bootstrap.o: bootstrap.c bootstrap.h stats.h dashboard.h export.h bootstrap.skel.h
 	$(CC) $(CFLAGS) -c bootstrap.c
 
 stats.o: stats.c stats.h bootstrap.h
@@ -30,6 +38,9 @@ stats.o: stats.c stats.h bootstrap.h
 
 dashboard.o: dashboard.c dashboard.h stats.h
 	$(CC) $(CFLAGS) -c dashboard.c
+
+export.o: export.c export.h stats.h
+	$(CC) $(CFLAGS) -c export.c
 
 # ===================== BPF =====================
 
@@ -44,3 +55,17 @@ bootstrap.skel.h: bootstrap.bpf.o
 
 clean:
 	rm -f *.o *.skel.h $(TARGET)
+
+# ===================== HELP =====================
+
+help:
+	@echo "Targets:"
+	@echo "  make              - build everything (auto-detects arch: $(ARCH))"
+	@echo "  make ARCH=arm64   - build for a specific arch"
+	@echo "  make clean        - remove build artifacts"
+	@echo ""
+	@echo "Manual BPF steps (if needed):"
+	@echo "  clang -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -c bootstrap.bpf.c -o bootstrap.bpf.o"
+	@echo "  bpftool gen skeleton bootstrap.bpf.o > bootstrap.skel.h"
+
+.PHONY: all clean help

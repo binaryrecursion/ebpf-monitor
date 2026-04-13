@@ -16,7 +16,6 @@
 #define COLOR_BOLD    "\033[1m"
 #define COLOR_DIM     "\033[2m"
 
-/* Latency coloring thresholds (µs) */
 #define LATENCY_GREEN_US   10
 #define LATENCY_YELLOW_US 100
 
@@ -34,10 +33,17 @@ static inline const char *deviation_color(double dev)
     return COLOR_RED;
 }
 
-/* ------------------------------------------------------------------ */
-/* Dashboard API                                                       */
-/* ------------------------------------------------------------------ */
-
-void dashboard_render(double elapsed);
+/*
+ * Render the full dashboard.
+ *
+ * elapsed       - seconds since start (or last reset)
+ * cpu_pct       - this process's CPU overhead %
+ * active_pid    - PID filter (0 = none)
+ * active_comm   - comm filter ("" = none)
+ * active_min_ms - min-duration filter (0 = none)
+ */
+void dashboard_render(double elapsed, double cpu_pct,
+                      int active_pid, const char *active_comm,
+                      long active_min_ms);
 
 #endif /* DASHBOARD_H */
