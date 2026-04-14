@@ -23,24 +23,39 @@ LIBS := -L$(LIBBPF_DIR)/lib/x86_64-linux-gnu -lbpf -lelf -lz -lm
 
 TARGET = bootstrap
 
+# ===================== SOURCES =====================
+
+SRCS = bootstrap.c stats.c dashboard.c export.c vscreen.c layout.c theme.c
+OBJS = $(SRCS:.c=.o)
+
 # ===================== BUILD =====================
 
 all: $(TARGET)
 
-$(TARGET): bootstrap.o stats.o dashboard.o export.o bootstrap.skel.h
-	$(CC) $(CFLAGS) -o $@ bootstrap.o stats.o dashboard.o export.o $(LIBS)
+$(TARGET): $(OBJS) bootstrap.skel.h
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
 
-bootstrap.o: bootstrap.c bootstrap.h stats.h dashboard.h export.h bootstrap.skel.h
+bootstrap.o: bootstrap.c bootstrap.h stats.h dashboard.h export.h \
+             bootstrap.skel.h term.h vscreen.h theme.h
 	$(CC) $(CFLAGS) -c bootstrap.c
 
 stats.o: stats.c stats.h bootstrap.h
 	$(CC) $(CFLAGS) -c stats.c
 
-dashboard.o: dashboard.c dashboard.h stats.h
+dashboard.o: dashboard.c dashboard.h stats.h vscreen.h layout.h theme.h term.h
 	$(CC) $(CFLAGS) -c dashboard.c
 
 export.o: export.c export.h stats.h
 	$(CC) $(CFLAGS) -c export.c
+
+vscreen.o: vscreen.c vscreen.h term.h
+	$(CC) $(CFLAGS) -c vscreen.c
+
+layout.o: layout.c layout.h vscreen.h
+	$(CC) $(CFLAGS) -c layout.c
+
+theme.o: theme.c theme.h
+	$(CC) $(CFLAGS) -c theme.c
 
 # ===================== BPF =====================
 
@@ -63,6 +78,10 @@ help:
 	@echo "  make              - build everything (auto-detects arch: $(ARCH))"
 	@echo "  make ARCH=arm64   - build for a specific arch"
 	@echo "  make clean        - remove build artifacts"
+	@echo ""
+	@echo "Runtime options:"
+	@echo "  --theme 0         - dark theme (default)"
+	@echo "  --theme 1         - Catppuccin Mocha theme"
 	@echo ""
 	@echo "Manual BPF steps (if needed):"
 	@echo "  clang -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -c bootstrap.bpf.c -o bootstrap.bpf.o"
