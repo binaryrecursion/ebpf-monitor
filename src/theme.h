@@ -3,12 +3,7 @@
 
 #include <stdint.h>
 
-
 #define rgb(r, g, b) ((uint32_t)(((r) << 16) | ((g) << 8) | (b)))
-
-/* ------------------------------------------------------------------ */
-/* Color helpers                                                        */
-/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
 /* Theme struct                                                         */
@@ -16,10 +11,11 @@
 
 typedef struct {
     /* Backgrounds */
-    uint32_t bg_panel;       /* panel interior background              */
+    uint32_t bg_panel;       /* panel interior + global fill background */
     uint32_t bg_header_row;  /* table header row background            */
     uint32_t bg_alt_row;     /* alternating row background             */
     uint32_t bg_selected;    /* selected / focused row                 */
+    uint32_t bg_anom_row;    /* anomaly-flagged row tint               */
 
     /* Text */
     uint32_t fg_primary;     /* bright white — main content            */
