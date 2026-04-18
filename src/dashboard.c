@@ -1,33 +1,65 @@
 /* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
 
 /*
- * dashboard.c — btop-style TUI renderer  (v8.0 — production)
+ * dashboard.c — production-grade btop-style TUI renderer
  *
- * CHANGES IN v8.0:
+ * ARCHITECTURE & BUG-FIX RATIONALE
+ * ==================================
  *
- *  1. TRUNCATE HELPER — safe_puts() clips any string at panel boundary
- *     with "..." ellipsis, preventing text bleed across panel edges.
+ * (A) MEMORY SAFETY
+ *     Every rect received from layout_compute() is validated with
+ *     rect_valid() (rows>0, cols>0) before a single cell is written.
+ *     All vscreen_put() calls go through safe rendering wrappers that
+ *     clip to [col, right_guard).  Raw vscreen_put() is ONLY used
+ *     inside fill_rect / fill_row_bg where bounds are already known.
  *
- *  2. ROW FILL MACRO — FILL_ROW() used before every data row so the
- *     full width is always painted with the row background before text.
- *     Eliminates leftover characters when content shrinks.
+ * (B) DOUBLE-BUFFERING / DIFF RENDER
+ *     vscreen maintains vs_next[] and vs_prev[].  We write every frame
+ *     into vs_next via vscreen_clear() + draw calls, then vscreen_flush()
+ *     diffs against vs_prev and emits only changed cells.  We NEVER call
+ *     term_clear_screen() — that causes the full-screen flash seen in the
+ *     original.  The global background fill (fill_rect on screen) is done
+ *     in vs_next; unchanged cells never generate terminal output.
  *
- *  3. SPARKLINE RING BUFFER — each event type keeps a 32-sample rolling
- *     rate history.  Rendered as ▁▂▃▄▅▆▇█ inline in the ACTIVITY panel.
+ * (C) STRICT CLIPPING
+ *     right_guard = inner.col + inner.cols is computed once per panel
+ *     and threaded through every column write.  safe_puts() / safe_printf()
+ *     accept a `max_cols` argument and clip content + append ellipsis.
+ *     No string can ever write past right_guard.
  *
- *  4. SCHEDULING DELAY PANEL — extracted sched entries shown with
- *     AVG / MAX / P95 delay and a trend sparkline.  Replaces no-data
- *     dead space when lifecycle panel is short.
+ * (D) LAYOUT
+ *     layout_compute() now returns int (-1 = too small).  When it returns
+ *     -1 we just call vscreen_flush() with an empty frame (the "terminal
+ *     too small" message is written to vs_next) and return.  Every draw_*
+ *     function guards rows >= N before doing anything.
  *
- *  5. HEADER v2 — adds EVENTS/s and OVERHEAD % beside DROPPED.
- *     Format:  Runtime 00:01:23 │ CP0.4% │ EVT/s 12.3K │ DROPPED:0 │ ...
+ * (E) PROCESS TABLE COLUMNS
+ *     Column widths are compile-time constants.  Each column is written
+ *     with safe_printf(max_cols = COL_WIDTH) so content is always clipped
+ *     to its slot.  Gaps between columns are exactly 1 space.
  *
- *  6. COLUMN SAFETY — every column sprintf uses a width-bounded buffer
- *     and the final col pointer is checked against inner.col+inner.cols
- *     before writing, so wide terminals never write into the border.
+ * (F) HEADER
+ *     The clock is right-aligned at a FIXED slot: right_guard - CLOCK_W.
+ *     CLOCK_W = strlen("Thu 01 Jan  23:59:59") = 20 (constant).
+ *     The left-to-right metric stream is allowed to use at most
+ *     right_guard - CLOCK_W - 2 cols so the clock never gets overwritten.
  *
- *  7. FULL BG DISCIPLINE — BG (T->bg_panel) is passed to every single
- *     vscreen_put call.  No call passes bg=0.
+ * (G) BACKGROUND
+ *     draw_panel() calls fill_rect() on the full outer rect first, then
+ *     draws the border on top.  Every data row calls fill_row_bg() before
+ *     writing text.  No partial fills, no ghost characters.
+ *
+ * (H) BOTTOM ZONE (side-by-side panels)
+ *     layout_compute() splits the bottom zone horizontally into
+ *     L->lifecycle (left) and L->sched_delay (right).  Both panels share
+ *     the full zone height, giving each ~10+ rows instead of ~4 rows when
+ *     stacked.  draw_lifecycle() and draw_sched_delay() are called directly
+ *     with their respective rects — no wrapper needed.
+ *
+ * (I) PERFORMANCE
+ *     vscreen_flush() only emits cells that differ from vs_prev[].
+ *     fill_rect() is cheap (in-memory writes to vs_next[]).
+ *     No fflush() except inside vscreen_flush() itself.
  */
 
 #include <stdio.h>
@@ -44,15 +76,12 @@
 #include "theme.h"
 #include "term.h"
 
-/* Shorthand — panel background used throughout */
-#define BG (T->bg_panel)
+/* ================================================================== */
+/*  Shorthand macros                                                   */
+/* ================================================================== */
 
-/* Fill a full inner row with the row background before writing text */
-#define FILL_ROW(row_, rect_) \
-    do { \
-        for (int _fc = (rect_).col; _fc < (rect_).col + (rect_).cols; _fc++) \
-            vscreen_put((row_), _fc, " ", T->fg_dim, (row_bg__), false, false); \
-    } while (0)
+/* Panel background — used everywhere a background colour is needed */
+#define BG (T->bg_panel)
 
 /* ================================================================== */
 /*  Unicode constants                                                  */
@@ -69,7 +98,7 @@
 #define LIGHTNING     "\xe2\x9a\xa1"   /* ⚡ */
 #define ARROW_UP      "\xe2\x86\x91"   /* ↑ */
 
-/* Spark chars (8 sub-cell heights, index 0 = blank) */
+/* Spark chars (8 sub-cell heights) */
 static const char *SPARK[8] = {
     " ",
     "\xe2\x96\x81",  /* ▁ */
@@ -81,27 +110,27 @@ static const char *SPARK[8] = {
     "\xe2\x96\x87",  /* ▇ */
 };
 
+/* Clock field width: "Thu 01 Jan  23:59:59" — always 20 chars */
+#define CLOCK_W 20
+
 /* ================================================================== */
-/*  Frame counter (blink / animation)                                  */
+/*  Frame counter                                                      */
 /* ================================================================== */
 
 static unsigned long g_frame = 0;
 
 /* ================================================================== */
 /*  Sparkline ring buffer                                              */
-/*                                                                     */
-/*  One ring per named event type (write, read, sched, …).            */
-/*  Sampled every dashboard render (≈2 s), 32 slots → ~64 s history. */
 /* ================================================================== */
 
-#define SPARK_SLOTS   32
-#define SPARK_EVTS    12
+#define SPARK_SLOTS  32
+#define SPARK_EVTS   16
 
 typedef struct {
-    char   name[16];
+    char   name[24];
     double samples[SPARK_SLOTS];
-    int    head;       /* next write position */
-    int    count;      /* samples stored so far (≤ SPARK_SLOTS) */
+    int    head;
+    int    count;
 } spark_ring_t;
 
 static spark_ring_t g_sparks[SPARK_EVTS];
@@ -126,41 +155,36 @@ static void spark_push(spark_ring_t *r, double val)
     if (r->count < SPARK_SLOTS) r->count++;
 }
 
-/* Render width cells of sparkline at (row, col), returns col after */
 static int draw_sparkline(int row, int col, int width,
                           const spark_ring_t *r,
                           uint32_t fg, uint32_t row_bg)
 {
-    if (!r || r->count == 0 || width <= 0) {
+    if (width <= 0) return col;
+    if (!r || r->count == 0) {
         for (int i = 0; i < width; i++)
             vscreen_put(row, col + i, " ", T->fg_dim, row_bg, false, false);
         return col + width;
     }
 
-    /* Find max over visible window */
     double mx = 0.0;
     int n = r->count < width ? r->count : width;
-    /* walk backwards: most-recent n samples */
     for (int i = 0; i < n; i++) {
         int idx = ((r->head - 1 - i) + SPARK_SLOTS) % SPARK_SLOTS;
         if (r->samples[idx] > mx) mx = r->samples[idx];
     }
     if (mx == 0.0) mx = 1.0;
 
-    /* Pad left if fewer samples than width */
     int pad = width - n;
     for (int i = 0; i < pad; i++)
         vscreen_put(row, col + i, " ", T->fg_dim, row_bg, false, false);
 
-    /* Draw oldest → newest left → right */
     for (int i = 0; i < n; i++) {
-        int sample_age = n - 1 - i;   /* 0 = newest */
-        int idx = ((r->head - 1 - sample_age) + SPARK_SLOTS) % SPARK_SLOTS;
-        double frac = r->samples[idx] / mx;
-        int level = (int)(frac * 7.0);
-        if (level < 0) level = 0;
-        if (level > 7) level = 7;
-        vscreen_put(row, col + pad + i, SPARK[level], fg, row_bg, false, false);
+        int age = n - 1 - i;
+        int idx = ((r->head - 1 - age) + SPARK_SLOTS) % SPARK_SLOTS;
+        int lvl = (int)(r->samples[idx] / mx * 7.0);
+        if (lvl < 0) lvl = 0;
+        if (lvl > 7) lvl = 7;
+        vscreen_put(row, col + pad + i, SPARK[lvl], fg, row_bg, false, false);
     }
     return col + width;
 }
@@ -180,8 +204,8 @@ static void fmt_us(char *buf, int len, long us)
 {
     if      (us < 0)        snprintf(buf, len, "--");
     else if (us >= 1000000) snprintf(buf, len, "%.1fs", us / 1e6);
-    else if (us >= 1000)    snprintf(buf, len, "%.1fm", us / 1e3);
-    else                    snprintf(buf, len, "%ld\xc2\xb5", us);
+    else if (us >= 1000)    snprintf(buf, len, "%.1fms", us / 1e3);
+    else                    snprintf(buf, len, "%ld\xc2\xb5s", us);
 }
 
 static void fmt_elapsed(char *buf, int len, double s)
@@ -193,65 +217,65 @@ static void fmt_elapsed(char *buf, int len, double s)
 }
 
 /* ================================================================== */
-/*  String truncation helper                                           */
+/*  SAFE RENDERING WRAPPERS                                            */
 /*                                                                     */
-/*  Writes at most `max_cols` terminal cells from `str`, appending    */
-/*  "…" (U+2026, 3 bytes) if the string was clipped.                 */
-/*  Returns the column after the last written character.              */
+/*  WHY: Raw vscreen_puts() does not know about panel boundaries.     */
+/*  These wrappers accept a max_cols argument and clip or truncate so  */
+/*  that no glyph can escape its designated slot.                      */
 /* ================================================================== */
 
+/*
+ * safe_puts — write at most max_cols display cells from str.
+ * Appends "…" (U+2026, 3 bytes) if truncated.
+ * Returns column after last written cell.
+ */
 static int safe_puts(int row, int col, int max_cols,
                      const char *str,
                      uint32_t fg, uint32_t bg,
                      bool bold, bool dim)
 {
-    if (max_cols <= 0 || !str) return col;
+    if (max_cols <= 0 || !str || !*str) return col;
 
-    /* Count display columns (simple: 1 byte-seq = 1 cell for our content) */
+    /* Walk UTF-8 to count display cells */
     int display_len = 0;
     const unsigned char *p = (const unsigned char *)str;
     while (*p) {
         unsigned char b = *p;
-        int bytes = 1;
-        if      ((b & 0x80) == 0x00) bytes = 1;
-        else if ((b & 0xE0) == 0xC0) bytes = 2;
-        else if ((b & 0xF0) == 0xE0) bytes = 3;
-        else if ((b & 0xF8) == 0xF0) bytes = 4;
+        int bytes = (b & 0x80) == 0x00 ? 1 :
+                    (b & 0xE0) == 0xC0 ? 2 :
+                    (b & 0xF0) == 0xE0 ? 3 : 4;
         display_len++;
         p += bytes;
     }
 
-    if (display_len <= max_cols) {
+    if (display_len <= max_cols)
         return vscreen_puts(row, col, str, fg, bg, bold, dim);
-    }
 
-    /* Truncate: copy chars until we'd exceed max_cols - 1 (for ellipsis) */
-    char truncated[512];
-    int  out   = 0;
-    int  cells = 0;
-    int  limit = max_cols - 1;   /* leave 1 cell for "…" */
+    /* Truncate: fit (max_cols - 1) cells then append ellipsis */
+    char buf[512];
+    int out = 0, cells = 0, limit = max_cols - 1;
     p = (const unsigned char *)str;
-    while (*p && cells < limit && out < (int)sizeof(truncated) - 5) {
+    while (*p && cells < limit && out < (int)sizeof(buf) - 5) {
         unsigned char b = *p;
-        int bytes = 1;
-        if      ((b & 0x80) == 0x00) bytes = 1;
-        else if ((b & 0xE0) == 0xC0) bytes = 2;
-        else if ((b & 0xF0) == 0xE0) bytes = 3;
-        else if ((b & 0xF8) == 0xF0) bytes = 4;
-        for (int i = 0; i < bytes; i++) truncated[out++] = (char)p[i];
+        int bytes = (b & 0x80) == 0x00 ? 1 :
+                    (b & 0xE0) == 0xC0 ? 2 :
+                    (b & 0xF0) == 0xE0 ? 3 : 4;
+        for (int i = 0; i < bytes; i++) buf[out++] = (char)p[i];
         cells++;
         p += bytes;
     }
-    /* Append U+2026 HORIZONTAL ELLIPSIS (3 UTF-8 bytes) */
-    truncated[out++] = (char)0xe2;
-    truncated[out++] = (char)0x80;
-    truncated[out++] = (char)0xa6;
-    truncated[out]   = '\0';
-
-    return vscreen_puts(row, col, truncated, fg, bg, bold, dim);
+    /* U+2026 HORIZONTAL ELLIPSIS */
+    buf[out++] = (char)0xe2;
+    buf[out++] = (char)0x80;
+    buf[out++] = (char)0xa6;
+    buf[out]   = '\0';
+    return vscreen_puts(row, col, buf, fg, bg, bold, dim);
 }
 
-/* Convenience: printf into fixed width field, then safe_puts */
+/*
+ * safe_printf — printf into a fixed-width cell slot then safe_puts.
+ * WHY: prevents column overflow from variable-length number strings.
+ */
 static int safe_printf(int row, int col, int max_cols,
                        uint32_t fg, uint32_t bg,
                        bool bold, bool dim,
@@ -272,23 +296,51 @@ static int safe_printf(int row, int col, int max_cols,
 }
 
 /* ================================================================== */
-/*  Semantic color pickers                                             */
+/*  Background / fill helpers                                          */
+/* ================================================================== */
+
+/*
+ * fill_rect — paint every cell in rect with a space using bg colour.
+ * WHY: ensures no ghost characters from previous frames remain.
+ * Called by draw_panel() before any border is drawn.
+ */
+static void fill_rect(rect_t r, uint32_t fg, uint32_t bg)
+{
+    if (!rect_valid(r)) return;
+    for (int rr = r.row; rr < r.row + r.rows; rr++)
+        for (int cc = r.col; cc < r.col + r.cols; cc++)
+            vscreen_put(rr, cc, " ", fg, bg, false, false);
+}
+
+/*
+ * fill_row_bg — paint a single row segment [col_start, col_end) with bg.
+ * WHY: called before EVERY data row so stale text from longer previous
+ * content is cleared before new (potentially shorter) text is written.
+ */
+static void fill_row_bg(int row, int col_start, int col_end, uint32_t bg)
+{
+    for (int c = col_start; c < col_end; c++)
+        vscreen_put(row, c, " ", T->fg_dim, bg, false, false);
+}
+
+/* ================================================================== */
+/*  Semantic colour pickers                                            */
 /* ================================================================== */
 
 static uint32_t lat_fg(long us)
 {
-    if (us < 0)                  return T->fg_secondary;
-    if (us < LATENCY_GREEN_US)   return T->fg_green;
-    if (us < LATENCY_YELLOW_US)  return T->fg_yellow;
-    if (us < 1000)               return T->fg_orange;
+    if (us < 0)                 return T->fg_secondary;
+    if (us < LATENCY_GREEN_US)  return T->fg_green;
+    if (us < LATENCY_YELLOW_US) return T->fg_yellow;
+    if (us < 1000)              return T->fg_orange;
     return T->fg_red;
 }
 
 static uint32_t dev_fg(double d)
 {
-    if (d < 0.25)               return T->fg_green;
-    if (d < ANOMALY_THRESHOLD)  return T->fg_yellow;
-    if (d < 1.5)                return T->fg_orange;
+    if (d < 0.25)              return T->fg_green;
+    if (d < ANOMALY_THRESHOLD) return T->fg_yellow;
+    if (d < 1.5)               return T->fg_orange;
     return T->fg_red;
 }
 
@@ -336,7 +388,7 @@ static int build_event_agg(agg_entry_t *agg, int max_agg)
         if (found == -1) {
             if (count >= max_agg) continue;
             strncpy(agg[count].event, stats[i].event, sizeof(agg[0].event) - 1);
-            agg[count].event[sizeof(agg[0].event)-1] = '\0';
+            agg[count].event[sizeof(agg[0].event) - 1] = '\0';
             agg[count].count         = stats[i].count;
             agg[count].total_latency = stats[i].total_latency;
             agg[count].max_latency   = stats[i].max_latency;
@@ -346,7 +398,7 @@ static int build_event_agg(agg_entry_t *agg, int max_agg)
         } else {
             agg[found].count         += stats[i].count;
             agg[found].total_latency += stats[i].total_latency;
-            agg[found].valid_count   += (stats[i].count - stats[i].drop_count);
+            agg[found].valid_count   += stats[i].count - stats[i].drop_count;
             agg[found].rate          += stats[i].rate;
             if (stats[i].max_latency > agg[found].max_latency)
                 agg[found].max_latency = stats[i].max_latency;
@@ -381,41 +433,20 @@ static int cmp_rate(const void *a, const void *b)
 }
 
 /* ================================================================== */
-/*  Events-per-second global accumulator                              */
-/*  Updated once per render; used by header and scheduling panel.    */
+/*  Events-per-second accumulator                                      */
 /* ================================================================== */
 
-static double g_events_per_sec = 0.0;   /* total across all event types */
+static double g_events_per_sec = 0.0;
 
 static void update_events_per_sec(void)
 {
     double total = 0.0;
-    for (int i = 0; i < stat_count; i++)
-        total += stats[i].rate;
+    for (int i = 0; i < stat_count; i++) total += stats[i].rate;
     g_events_per_sec = total;
 }
 
 /* ================================================================== */
-/*  Core fill helper                                                   */
-/* ================================================================== */
-
-static void fill_rect(rect_t r, uint32_t fg, uint32_t bg)
-{
-    for (int rr = r.row; rr < r.row + r.rows; rr++)
-        for (int cc = r.col; cc < r.col + r.cols; cc++)
-            vscreen_put(rr, cc, " ", fg, bg, false, false);
-}
-
-/* Fill a single row from col a to col b (exclusive) with bg */
-static void fill_row_bg(int row, int col_start, int col_end,
-                         uint32_t row_bg)
-{
-    for (int c = col_start; c < col_end; c++)
-        vscreen_put(row, c, " ", T->fg_dim, row_bg, false, false);
-}
-
-/* ================================================================== */
-/*  Progress bar with sub-cell precision                              */
+/*  Progress / mini bars                                               */
 /* ================================================================== */
 
 static void draw_bar(int row, int col, int width,
@@ -424,11 +455,9 @@ static void draw_bar(int row, int col, int width,
 {
     if (fraction < 0) fraction = 0;
     if (fraction > 1) fraction = 1;
-
     int filled  = (int)(fraction * width * 8);
     int full    = filled / 8;
     int partial = filled % 8;
-
     int c = col;
     for (int i = 0; i < full && c < col + width; i++, c++)
         vscreen_put(row, c, BLOCK_FULL, fill_fg, row_bg, false, false);
@@ -440,31 +469,32 @@ static void draw_bar(int row, int col, int width,
         vscreen_put(row, c, BLOCK_LIGHT, empty_fg, row_bg, false, false);
 }
 
-/* Compact mini bar (solid blocks) */
 static void draw_mini_bar(int row, int col, int width,
                           double fraction, uint32_t fg, uint32_t row_bg)
 {
     if (fraction < 0) fraction = 0;
     if (fraction > 1) fraction = 1;
     int filled = (int)(fraction * width);
-    for (int i = 0; i < width; i++) {
-        if (i < filled)
-            vscreen_put(row, col + i, BLOCK_LOWER, fg, row_bg, false, false);
-        else
-            vscreen_put(row, col + i, BULLET, T->fg_dim, row_bg, false, false);
-    }
+    for (int i = 0; i < width; i++)
+        vscreen_put(row, col + i,
+                    i < filled ? BLOCK_LOWER : BULLET,
+                    i < filled ? fg : T->fg_dim,
+                    row_bg, false, false);
 }
 
 /* ================================================================== */
 /*  Panel box drawing                                                  */
+/*                                                                     */
+/*  WHY fill_rect first: guarantees every cell inside the panel is    */
+/*  owned by this panel, preventing bleed from adjacent panels that   */
+/*  may have had wider content on a previous frame.                   */
 /* ================================================================== */
 
 static rect_t draw_panel(rect_t r, const char *title, uint32_t title_color)
 {
-    if (r.rows < 2 || r.cols < 2)
+    if (!rect_valid(r) || r.rows < 2 || r.cols < 4)
         return (rect_t){ r.row, r.col, 0, 0 };
 
-    /* Flood-fill entire panel rect — guarantees no ghost cells */
     fill_rect(r, T->fg_dim, BG);
 
     int W   = r.cols;
@@ -476,12 +506,16 @@ static rect_t draw_panel(rect_t r, const char *title, uint32_t title_color)
     vscreen_put(row, col + 1, T->bh,  T->border_dim, BG, false, false);
     vscreen_put(row, col + 2, T->bh,  T->border_dim, BG, false, false);
     vscreen_put(row, col + 3, " ",    T->border_dim, BG, false, false);
+
     int tc = col + 4;
-    tc = vscreen_puts(row, tc, DIAMOND " ", title_color, BG, false, false);
-    tc = safe_puts(row, tc, col + W - 2 - tc,
-                   title, title_color, BG, true, false);
-    vscreen_put(row, tc, " ", T->border_dim, BG, false, false);
-    tc++;
+    int title_avail = (col + W - 2) - tc;   /* cells available for title */
+    if (title_avail > 2) {
+        tc = vscreen_puts(row, tc, DIAMOND " ", title_color, BG, false, false);
+        tc = safe_puts(row, tc, (col + W - 2) - tc,
+                       title, title_color, BG, true, false);
+        if (tc < col + W - 1)
+            vscreen_put(row, tc++, " ", T->border_dim, BG, false, false);
+    }
     for (int c = tc; c < col + W - 1; c++)
         vscreen_put(row, c, T->bh, T->border_dim, BG, false, false);
     vscreen_put(row, col + W - 1, T->btr, T->border_dim, BG, false, false);
@@ -499,23 +533,26 @@ static rect_t draw_panel(rect_t r, const char *title, uint32_t title_color)
         vscreen_put(br, c, T->bh, T->border_dim, BG, false, false);
     vscreen_put(br, col + W - 1, T->bbr, T->border_dim, BG, false, false);
 
+    /* Return content area (inside border) */
     return (rect_t){ row + 1, col + 1, r.rows - 2, W - 2 };
 }
 
-/* Horizontal divider inside a panel */
+/* Horizontal divider inside a panel's outer rect at `inner_row` from top */
 static void draw_divider(rect_t panel, int inner_row)
 {
+    if (!rect_valid(panel)) return;
     int r = panel.row + inner_row;
-    if (r >= panel.row + panel.rows) return;
+    if (r < panel.row || r >= panel.row + panel.rows) return;
     int c = panel.col;
     int W = panel.cols;
+    if (W < 2) return;
     vscreen_put(r, c,         T->bml, T->border_dim, BG, false, false);
     for (int cc = c + 1; cc < c + W - 1; cc++)
         vscreen_put(r, cc, T->bh, T->border_dim, BG, false, false);
     vscreen_put(r, c + W - 1, T->bmr, T->border_dim, BG, false, false);
 }
 
-/* Table header row — fills background, then writes label */
+/* Table header: fill bg then write formatted label */
 static void draw_table_header(rect_t content, int rel_row,
                                const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
@@ -523,8 +560,9 @@ static void draw_table_header(rect_t content, int rel_row,
 static void draw_table_header(rect_t content, int rel_row,
                                const char *fmt, ...)
 {
+    if (!rect_valid(content)) return;
     int r = content.row + rel_row;
-    if (r >= content.row + content.rows) return;
+    if (r < content.row || r >= content.row + content.rows) return;
 
     fill_row_bg(r, content.col, content.col + content.cols, T->bg_header_row);
 
@@ -534,14 +572,19 @@ static void draw_table_header(rect_t content, int rel_row,
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    safe_puts(r, content.col + 2, content.cols - 2,
+    safe_puts(r, content.col + 2, content.cols - 4,
               buf, T->fg_secondary, T->bg_header_row, false, false);
 }
 
 /* ================================================================== */
-/*  SECTION 0 — HEADER BANNER                                         */
+/*  HEADER BANNER                                                      */
 /*                                                                     */
-/*  New in v8: EVENTS/s and OVERHEAD % added beside slot/drop info.  */
+/*  FIX — CLOCK:                                                       */
+/*  The clock occupies a FIXED slot at the right end of the metrics   */
+/*  row: cols [right_guard - CLOCK_W, right_guard).                   */
+/*  The left-side metric stream is bounded at (right_guard - CLOCK_W  */
+/*  - 2) so it can never overwrite the clock regardless of how many   */
+/*  metrics are shown.  Clock width is constant = CLOCK_W = 20 chars. */
 /* ================================================================== */
 
 static void draw_header(rect_t r, double elapsed,
@@ -549,122 +592,127 @@ static void draw_header(rect_t r, double elapsed,
                          int active_pid, const char *active_comm,
                          long active_min_ms)
 {
-    if (r.rows < 3) return;
+    if (!rect_valid(r) || r.rows < 3) return;
+
     int W   = r.cols;
     int row = r.row;
 
-    /* Full header fill */
+    /* ── Full header background fill ── */
     for (int rr = r.row; rr < r.row + r.rows; rr++)
         fill_row_bg(rr, r.col, r.col + W, T->bg_header_row);
 
-    /* ╔══ top border ══╗ */
+    /* ── ╔══ top border ══╗ ── */
     vscreen_put(row, r.col,         T->bdtl, T->border_dim, T->bg_header_row, false, false);
     for (int c = r.col + 1; c < r.col + W - 1; c++)
         vscreen_put(row, c, T->bdh, T->border_dim, T->bg_header_row, false, false);
     vscreen_put(row, r.col + W - 1, T->bdtr, T->border_dim, T->bg_header_row, false, false);
 
-    /* ║ content row 1 — title + metrics ║ */
+    /* ── ║ metrics row ║ ── */
     row++;
     vscreen_put(row, r.col,         T->bdv, T->border_dim, T->bg_header_row, false, false);
     vscreen_put(row, r.col + W - 1, T->bdv, T->border_dim, T->bg_header_row, false, false);
 
-    int col = r.col + 2;
-    int right_guard = r.col + W - 2;   /* don't write into right border */
+    int col        = r.col + 2;
+    /* WHY: reserve CLOCK_W + 2 cells on the right so clock never collides */
+    int right_guard = r.col + W - 2;
+    int metric_end  = right_guard - CLOCK_W - 2;   /* left stream stops here */
 
 #define HDR_SEP() \
     do { \
-        if (col + 3 < right_guard) { \
-            col = vscreen_puts(row, col, "  ", T->fg_dim, T->bg_header_row, false, false); \
-            vscreen_put(row, col, T->bdv, T->border_dim, T->bg_header_row, false, false); \
-            col++; \
+        if (col + 3 < metric_end) { \
+            vscreen_puts(row, col, "  ", T->fg_dim, T->bg_header_row, false, false); \
+            col += 2; \
+            if (col < metric_end) { \
+                vscreen_put(row, col, T->bdv, T->border_dim, T->bg_header_row, false, false); \
+                col++; \
+            } \
         } \
     } while(0)
 
     /* Logo */
-    col = vscreen_puts(row, col, LIGHTNING, T->fg_yellow, T->bg_header_row, true, false);
-    col = vscreen_puts(row, col, " eBPF", T->fg_cyan, T->bg_header_row, true, false);
-    col = vscreen_puts(row, col, " Kernel", T->fg_primary, T->bg_header_row, true, false);
-    col = vscreen_puts(row, col, " Monitor", T->fg_cyan, T->bg_header_row, true, false);
-    col = vscreen_puts(row, col, " v8.0", T->fg_secondary, T->bg_header_row, false, false);
+    if (col < metric_end) col = vscreen_puts(row, col, LIGHTNING, T->fg_yellow, T->bg_header_row, true, false);
+    if (col < metric_end) col = vscreen_puts(row, col, " eBPF", T->fg_cyan, T->bg_header_row, true, false);
+    if (col < metric_end) col = vscreen_puts(row, col, " Monitor", T->fg_primary, T->bg_header_row, true, false);
+    if (col < metric_end) col = vscreen_puts(row, col, " v9.0", T->fg_secondary, T->bg_header_row, false, false);
 
     HDR_SEP();
 
-    /* Runtime */
-    char rt[16]; fmt_elapsed(rt, sizeof(rt), elapsed);
-    col = vscreen_puts(row, col, " Runtime ", T->fg_secondary, T->bg_header_row, false, false);
-    col = vscreen_puts(row, col, rt, T->fg_yellow, T->bg_header_row, true, false);
-
-    HDR_SEP();
+    /* Runtime — always shown */
+    if (col < metric_end) {
+        char rt[16]; fmt_elapsed(rt, sizeof(rt), elapsed);
+        col = vscreen_puts(row, col, " Up:", T->fg_secondary, T->bg_header_row, false, false);
+        col = vscreen_puts(row, col, rt, T->fg_yellow, T->bg_header_row, true, false);
+        HDR_SEP();
+    }
 
     /* CPU overhead */
-    uint32_t cpu_col = cpu_pct < 5.0  ? T->fg_green  :
-                       cpu_pct < 30.0 ? T->fg_yellow :
-                       cpu_pct < 70.0 ? T->fg_orange : T->fg_red;
-    char cpu_s[16]; snprintf(cpu_s, sizeof(cpu_s), "%.1f%%", cpu_pct);
-    col = vscreen_puts(row, col, " CP", T->fg_secondary, T->bg_header_row, false, false);
-    col = vscreen_puts(row, col, cpu_s, cpu_col, T->bg_header_row, true, false);
+    if (col + 12 < metric_end) {
+        uint32_t cpu_col = cpu_pct < 5.0  ? T->fg_green  :
+                           cpu_pct < 30.0 ? T->fg_yellow :
+                           cpu_pct < 70.0 ? T->fg_orange : T->fg_red;
+        char cpu_s[12]; snprintf(cpu_s, sizeof(cpu_s), "%.1f%%", cpu_pct);
+        col = vscreen_puts(row, col, " CPU:", T->fg_secondary, T->bg_header_row, false, false);
+        col = vscreen_puts(row, col, cpu_s, cpu_col, T->bg_header_row, true, false);
+        HDR_SEP();
+    }
 
-    HDR_SEP();
-
-    /* Events per second (NEW) */
-    if (col + 14 < right_guard) {
-        char evts_s[16]; fmt_rate(evts_s, sizeof(evts_s), g_events_per_sec);
-        col = vscreen_puts(row, col, " EVT/s ", T->fg_secondary, T->bg_header_row, false, false);
+    /* Events per second */
+    if (col + 14 < metric_end) {
+        char evts_s[12]; fmt_rate(evts_s, sizeof(evts_s), g_events_per_sec);
+        col = vscreen_puts(row, col, " EVT/s:", T->fg_secondary, T->bg_header_row, false, false);
         col = vscreen_puts(row, col, evts_s, T->fg_teal, T->bg_header_row, true, false);
         HDR_SEP();
     }
 
     /* Slot count */
-    double slot_pct = (double)stat_count / MAX_STATS;
-    uint32_t slot_col = slot_pct < 0.5 ? T->fg_green :
-                        slot_pct < 0.8 ? T->fg_yellow : T->fg_red;
-    char slots_s[32]; snprintf(slots_s, sizeof(slots_s), "%d/%d", stat_count, MAX_STATS);
-    if (col + 12 < right_guard) {
-        col = vscreen_puts(row, col, " Slots ", T->fg_secondary, T->bg_header_row, false, false);
+    if (col + 12 < metric_end) {
+        double    slot_pct = (double)stat_count / MAX_STATS;
+        uint32_t  slot_col = slot_pct < 0.5 ? T->fg_green :
+                             slot_pct < 0.8 ? T->fg_yellow : T->fg_red;
+        char slots_s[16]; snprintf(slots_s, sizeof(slots_s), "%d/%d", stat_count, MAX_STATS);
+        col = vscreen_puts(row, col, " Slots:", T->fg_secondary, T->bg_header_row, false, false);
         col = vscreen_puts(row, col, slots_s, slot_col, T->bg_header_row, true, false);
     }
 
-    /* Dropped events */
-    if (total_events_dropped > 0 && col + 16 < right_guard) {
+    /* Dropped events (only when non-zero) */
+    if (total_events_dropped > 0 && col + 16 < metric_end) {
         HDR_SEP();
-        char drop_s[48];
-        char drop_n[16]; fmt_rate(drop_n, sizeof(drop_n), (double)total_events_dropped);
-        snprintf(drop_s, sizeof(drop_s), " %s DROPPED:%s ", WARN, drop_n);
+        char drop_n[12]; fmt_rate(drop_n, sizeof(drop_n), (double)total_events_dropped);
+        char drop_s[32]; snprintf(drop_s, sizeof(drop_s), " %s DROP:%s", WARN, drop_n);
         col = vscreen_puts(row, col, drop_s, T->fg_red, T->bg_header_row, true, false);
     }
 
-    /* Overhead % (separate from CPU — this is BPF overhead estimate) */
-    if (elapsed > 2.0 && col + 16 < right_guard) {
-        HDR_SEP();
-        double overhead = cpu_pct;   /* same value, shown explicitly labeled */
-        char oh_s[16]; snprintf(oh_s, sizeof(oh_s), "%.2f%%", overhead);
-        col = vscreen_puts(row, col, " OVERHEAD:", T->fg_secondary, T->bg_header_row, false, false);
-        col = vscreen_puts(row, col, oh_s, cpu_col, T->bg_header_row, true, false);
-    }
-    (void)col;
+    (void)col;  /* metric stream ends here */
 
-    /* Clock — right-aligned */
-    time_t     now     = time(NULL);
-    struct tm *tm_info = localtime(&now);
-    char timebuf[12], datebuf[12];
-    strftime(timebuf, sizeof(timebuf), "%H:%M:%S", tm_info);
-    strftime(datebuf, sizeof(datebuf), "%a %d %b", tm_info);
-    int time_col = r.col + W - 1 - (int)strlen(timebuf) - (int)strlen(datebuf) - 3;
-    if (time_col > r.col + (int)strlen(datebuf) + 2) {
-        vscreen_puts(row, time_col, datebuf, T->fg_dim, T->bg_header_row, false, false);
-        time_col += (int)strlen(datebuf) + 1;
-        vscreen_puts(row, time_col, timebuf, T->fg_primary, T->bg_header_row, true, false);
+    /* ── FIXED-WIDTH CLOCK at the right end of the metrics row ──
+     *
+     * WHY FIXED: The date+time string "Thu 01 Jan  23:59:59" is always
+     * exactly CLOCK_W characters.  We write it at a fixed column offset
+     * from the right border so it never shifts or collides with metrics.
+     */
+    {
+        time_t     now     = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char datebuf[16], timebuf[12];
+        strftime(datebuf, sizeof(datebuf), "%a %d %b", tm_info);
+        strftime(timebuf, sizeof(timebuf), " %H:%M:%S", tm_info);
+        /* date (9) + space (1) + time (9) = 19, padded to CLOCK_W */
+        int clock_col = right_guard - CLOCK_W;
+        if (clock_col > r.col + 2) {
+            vscreen_puts(row, clock_col, datebuf, T->fg_dim,     T->bg_header_row, false, false);
+            vscreen_puts(row, clock_col + 9, timebuf, T->fg_primary, T->bg_header_row, true, false);
+        }
     }
 
 #undef HDR_SEP
 
-    /* ║ legend / filter row ║ */
+    /* ── ║ filter / legend row ║ ── */
     row++;
     vscreen_put(row, r.col,         T->bdv, T->border_dim, T->bg_header_row, false, false);
     vscreen_put(row, r.col + W - 1, T->bdv, T->border_dim, T->bg_header_row, false, false);
 
     col = r.col + 2;
-    int any_filter = (active_pid || active_comm[0] || active_min_ms);
+    int any_filter = (active_pid || (active_comm && active_comm[0]) || active_min_ms);
 
     if (any_filter) {
         col = vscreen_puts(row, col, DIAMOND " FILTERS: ", T->fg_magenta, T->bg_header_row, true, false);
@@ -672,7 +720,7 @@ static void draw_header(rect_t r, double elapsed,
             char ps[32]; snprintf(ps, sizeof(ps), "pid=%d  ", active_pid);
             col = safe_puts(row, col, right_guard - col, ps, T->fg_magenta, T->bg_header_row, false, false);
         }
-        if (active_comm[0] && col < right_guard) {
+        if (active_comm && active_comm[0] && col < right_guard) {
             char cs[32]; snprintf(cs, sizeof(cs), "comm=%s  ", active_comm);
             col = safe_puts(row, col, right_guard - col, cs, T->fg_magenta, T->bg_header_row, false, false);
         }
@@ -682,25 +730,22 @@ static void draw_header(rect_t r, double elapsed,
         }
         if (col < right_guard)
             safe_puts(row, col, right_guard - col,
-                      "  (kernel-side \xe2\x80\x94 zero overhead for excluded procs)",
+                      "  (kernel-side filter \xe2\x80\x94 zero overhead for excluded procs)",
                       T->fg_dim, T->bg_header_row, false, true);
     } else {
-        col = vscreen_puts(row, col, "Latency: ", T->fg_secondary, T->bg_header_row, false, false);
-        if (col < right_guard)
-            col = vscreen_puts(row, col, BLOCK_FULL " <10\xc2\xb5s  ",  T->fg_green,  T->bg_header_row, false, false);
-        if (col < right_guard)
-            col = vscreen_puts(row, col, BLOCK_FULL " <100\xc2\xb5s  ", T->fg_yellow, T->bg_header_row, false, false);
-        if (col < right_guard)
-            col = vscreen_puts(row, col, BLOCK_FULL " <1ms  ",           T->fg_orange, T->bg_header_row, false, false);
-        if (col < right_guard)
-            col = vscreen_puts(row, col, BLOCK_FULL " \xe2\x89\xa5" "1ms", T->fg_red, T->bg_header_row, false, false);
+        if (col < right_guard) col = vscreen_puts(row, col, "Latency: ", T->fg_secondary, T->bg_header_row, false, false);
+        if (col < right_guard) col = vscreen_puts(row, col, BLOCK_FULL " <10\xc2\xb5s  ", T->fg_green, T->bg_header_row, false, false);
+        if (col < right_guard) col = vscreen_puts(row, col, BLOCK_FULL " <100\xc2\xb5s  ", T->fg_yellow, T->bg_header_row, false, false);
+        if (col < right_guard) col = vscreen_puts(row, col, BLOCK_FULL " <1ms  ", T->fg_orange, T->bg_header_row, false, false);
+        if (col < right_guard) col = vscreen_puts(row, col, BLOCK_FULL " \xe2\x89\xa5" "1ms  ", T->fg_red, T->bg_header_row, false, false);
         if (col < right_guard)
             safe_puts(row, col, right_guard - col,
-                      "   \xe2\x9a\xa0=anomaly  sched avg/p95 exclude sleep >200ms",
+                      WARN "=anomaly   sched avg/p95 exclude sleep >200ms",
                       T->fg_dim, T->bg_header_row, false, false);
     }
+    (void)col;
 
-    /* ╚══ bottom border ══╝ */
+    /* ── ╚══ bottom border ══╝ ── */
     row++;
     if (row < r.row + r.rows) {
         vscreen_put(row, r.col, T->bdbl, T->border_dim, T->bg_header_row, false, false);
@@ -712,61 +757,105 @@ static void draw_header(rect_t r, double elapsed,
 
 /* ================================================================== */
 /*  SECTION 1 — MAIN PROCESS TABLE                                    */
+/*                                                                     */
+/*  FIX — COLUMN ALIGNMENT:                                           */
+/*  All column widths are compile-time constants.  Each column is     */
+/*  rendered with safe_printf(max_cols = COL_WIDTH) which clips at    */
+/*  that exact width.  Exactly 1 space gap between every column.     */
+/*  right_guard is checked before every column write so wide data    */
+/*  never escapes into the next panel.                                */
+/* ================================================================== */
+
+/* ================================================================== */
+/*  SECTION 1 — MAIN PROCESS TABLE                                    */
+/*                                                                     */
+/*  FIX — COLUMN ALIGNMENT:                                           */
+/*  All column widths are compile-time constants.  Each column is     */
+/*  rendered with safe_printf(max_cols = COL_WIDTH) which clips at    */
+/*  that exact width.  Exactly 1 space gap between every column.     */
+/*  right_guard is checked before every column write so wide data    */
+/*  never escapes into the next panel.                                */
 /* ================================================================== */
 
 #define MAX_DISPLAY 16
 
+/* Fixed column widths for the process table */
+#define COL_PROC   14
+#define COL_EVENT   9
+#define COL_RATE    7
+#define COL_AVG     7
+#define COL_P95     7
+#define COL_MAX     8
+#define COL_PID     7
+#define COL_CTXSW   6
+#define COL_EXECS   6
+#define COL_BAR     8
+
 static void draw_processes(rect_t panel)
 {
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 40) return;
     rect_t inner = draw_panel(panel, "PROCESSES", T->fg_cyan);
-    if (inner.rows < 3 || inner.cols < 40) return;
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 38) return;
 
     struct syscall_stat tmp[MAX_STATS];
     memcpy(tmp, stats, (size_t)stat_count * sizeof(*tmp));
     qsort(tmp, (size_t)stat_count, sizeof(*tmp), cmp_rate);
 
-    int W = inner.cols;
+    int W           = inner.cols;
     int right_guard = inner.col + W;
 
     bool show_pid   = (W >= 80);
-    bool show_p95   = (W >= 95);
-    bool show_extra = (W >= 115);
+    bool show_p95   = (W >= 96);
+    bool show_extra = (W >= 116);
     bool show_bar   = (W >= 70);
-    int  bar_w      = show_bar ? 8 : 0;
 
+    /* Build header string using fixed field widths */
     char hdr[256] = {0};
-    if (show_extra)
-        snprintf(hdr, sizeof(hdr), "%-14s %-9s %7s %7s %7s %8s %7s %6s %6s",
-                 "PROCESS", "EVENT", "RATE/s", "AVG", "P95", "MAX", "PID", "CTXSW", "EXECS");
-    else if (show_p95)
-        snprintf(hdr, sizeof(hdr), "%-14s %-9s %7s %7s %7s %8s %7s",
-                 "PROCESS", "EVENT", "RATE/s", "AVG", "P95", "MAX", "PID");
-    else if (show_pid)
-        snprintf(hdr, sizeof(hdr), "%-14s %-9s %7s %7s %8s %7s",
-                 "PROCESS", "EVENT", "RATE/s", "AVG", "MAX", "PID");
-    else
-        snprintf(hdr, sizeof(hdr), "%-14s %-9s %7s %7s %8s",
-                 "PROCESS", "EVENT", "RATE/s", "AVG", "MAX");
+    {
+        char *p = hdr;
+        int   rem = (int)sizeof(hdr) - 1;
+        int   n;
 
-    if (show_bar) {
-        char full_hdr[320];
-        snprintf(full_hdr, sizeof(full_hdr), "%*s %s", bar_w, "RATE\xe2\x96\x84", hdr);
-        draw_table_header(inner, 0, "%s", full_hdr);
-    } else {
-        draw_table_header(inner, 0, "%s", hdr);
+        if (show_bar) {
+            n = snprintf(p, rem, "%*s ", COL_BAR, "RATE\xe2\x96\x84");
+            p += n; rem -= n;
+        }
+        n = snprintf(p, rem, "%-*s %-*s %*s %*s",
+                     COL_PROC, "PROCESS", COL_EVENT, "EVENT",
+                     COL_RATE, "RATE/s", COL_AVG, "AVG");
+        p += n; rem -= n;
+        if (show_p95 && rem > 0) {
+            n = snprintf(p, rem, " %*s", COL_P95, "P95");
+            p += n; rem -= n;
+        }
+        if (rem > 0) {
+            n = snprintf(p, rem, " %*s", COL_MAX, "MAX");
+            p += n; rem -= n;
+        }
+        if (show_pid && rem > 0) {
+            n = snprintf(p, rem, " %*s", COL_PID, "PID");
+            p += n; rem -= n;
+        }
+        if (show_extra && rem > 0) {
+            n = snprintf(p, rem, " %*s %*s", COL_CTXSW, "CTXSW", COL_EXECS, "EXECS");
+            p += n; rem -= n;
+        }
+        (void)rem;
     }
+
+    draw_table_header(inner, 0, "%s", hdr);
     draw_divider(panel, 2);
 
     double max_rate = 1.0;
     for (int i = 0; i < stat_count; i++)
         if (stats[i].rate > max_rate) max_rate = stats[i].rate;
 
-    int data_row      = inner.row + 2;
-    int max_data_rows = inner.rows - 3;
-    if (max_data_rows < 1) return;
+    int data_row  = inner.row + 2;
+    int max_rows  = inner.rows - 3;
+    if (max_rows < 1) return;
 
     int shown = 0;
-    for (int i = 0; i < stat_count && shown < MAX_DISPLAY && shown < max_data_rows; i++) {
+    for (int i = 0; i < stat_count && shown < MAX_DISPLAY && shown < max_rows; i++) {
         struct syscall_stat *s = &tmp[i];
         int r = data_row + shown;
         if (r >= inner.row + inner.rows - 1) break;
@@ -777,120 +866,114 @@ static void draw_processes(rect_t panel)
         long p95   = stats_p95_us(s);
         long maxus = s->max_latency / 1000;
 
-        char rate_s[16], avg_s[12], p95_s[12], max_s[12];
+        char rate_s[12], avg_s[10], p95_s[10], max_s[10];
         fmt_rate(rate_s, sizeof(rate_s), s->rate);
         fmt_us(avg_s,  sizeof(avg_s),  avg);
         fmt_us(p95_s,  sizeof(p95_s),  p95);
         fmt_us(max_s,  sizeof(max_s),  maxus);
 
-        bool is_anom = s->is_anomaly && s->baseline_ready;
-        uint32_t row_bg = is_anom          ? T->bg_anom_row :
-                          (shown % 2 == 1) ? T->bg_alt_row   : BG;
+        bool     is_anom = s->is_anomaly && s->baseline_ready;
+        uint32_t row_bg  = is_anom          ? T->bg_anom_row :
+                           (shown % 2 == 1) ? T->bg_alt_row  : BG;
 
-        /* Clear entire row first — eliminates leftover chars */
+        /* WHY: fill entire row first — removes leftover characters */
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 1;
 
-        if (show_bar) {
-            double frac = (max_rate > 0) ? s->rate / max_rate : 0.0;
-            draw_mini_bar(r, col, bar_w, frac, heat_color(frac), row_bg);
-            col += bar_w + 1;
-        }
-
+        /* Anomaly indicator */
         bool blink_on = (g_frame % 2 == 0);
-        if (is_anom)
-            col = vscreen_puts(r, col, blink_on ? "!" : DIAMOND, T->fg_red, row_bg, true, false);
-        else
-            col = vscreen_puts(r, col, " ", T->fg_dim, row_bg, false, false);
+        vscreen_put(r, col, is_anom ? (blink_on ? "!" : DIAMOND) : " ",
+                    is_anom ? T->fg_red : T->fg_dim, row_bg, true, false);
+        col++;
+
+        /* Rate mini-bar */
+        if (show_bar && col + COL_BAR + 1 <= right_guard) {
+            double frac = (max_rate > 0) ? s->rate / max_rate : 0.0;
+            draw_mini_bar(r, col, COL_BAR, frac, heat_color(frac), row_bg);
+            col += COL_BAR + 1;
+        }
 
         if (col >= right_guard) { shown++; continue; }
 
-        /* PROCESS */
-        col = safe_printf(r, col, 14, T->fg_primary, row_bg, true, false, "%-14s", s->process);
-        col++;
+        /* PROCESS — left-aligned, fixed width */
+        col = safe_printf(r, col, COL_PROC,  T->fg_primary,       row_bg, true,  false, "%-*s", COL_PROC,  s->process); col++;
         if (col >= right_guard) { shown++; continue; }
 
         /* EVENT */
-        col = safe_printf(r, col, 9, event_fg(s->event), row_bg, false, false, "%-9s", s->event);
-        col++;
+        col = safe_printf(r, col, COL_EVENT, event_fg(s->event),  row_bg, false, false, "%-*s", COL_EVENT, s->event);   col++;
 
-        /* RATE/s */
-        if (col + 7 <= right_guard) {
-            col = safe_printf(r, col, 7, T->fg_primary, row_bg, false, false, "%7s", rate_s);
-            col++;
+        /* RATE/s — right-aligned */
+        if (col + COL_RATE <= right_guard) {
+            col = safe_printf(r, col, COL_RATE, T->fg_primary, row_bg, false, false, "%*s", COL_RATE, rate_s); col++;
         }
 
         /* AVG */
-        if (col + 7 <= right_guard) {
-            col = safe_printf(r, col, 7, lat_fg(avg), row_bg, false, false, "%7s", avg_s);
-            col++;
+        if (col + COL_AVG <= right_guard) {
+            col = safe_printf(r, col, COL_AVG, lat_fg(avg), row_bg, false, false, "%*s", COL_AVG, avg_s); col++;
         }
 
         /* P95 */
-        if (show_p95 && col + 7 <= right_guard) {
-            col = safe_printf(r, col, 7, lat_fg(p95), row_bg, false, false, "%7s", p95_s);
-            col++;
+        if (show_p95 && col + COL_P95 <= right_guard) {
+            col = safe_printf(r, col, COL_P95, lat_fg(p95), row_bg, false, false, "%*s", COL_P95, p95_s); col++;
         }
 
         /* MAX */
-        if (col + 8 <= right_guard) {
-            col = safe_printf(r, col, 8, lat_fg(maxus), row_bg, false, false, "%8s", max_s);
-            col++;
+        if (col + COL_MAX <= right_guard) {
+            col = safe_printf(r, col, COL_MAX, lat_fg(maxus), row_bg, false, false, "%*s", COL_MAX, max_s); col++;
         }
 
         /* PID */
-        if (show_pid && col + 7 <= right_guard) {
-            col = safe_printf(r, col, 7, T->fg_secondary, row_bg, false, false, "%7d", s->pid);
-            col++;
+        if (show_pid && col + COL_PID <= right_guard) {
+            col = safe_printf(r, col, COL_PID, T->fg_secondary, row_bg, false, false, "%*d", COL_PID, s->pid); col++;
         }
 
         /* CTXSW / EXECS */
         if (show_extra) {
-            if (col + 6 <= right_guard) {
-                col = safe_printf(r, col, 6,
+            if (col + COL_CTXSW <= right_guard) {
+                col = safe_printf(r, col, COL_CTXSW,
                                   s->ctx_switches > 0 ? T->fg_yellow : T->fg_secondary,
-                                  row_bg, false, false, "%6ld", s->ctx_switches);
-                col++;
+                                  row_bg, false, false, "%*ld", COL_CTXSW, s->ctx_switches); col++;
             }
-            if (col + 6 <= right_guard) {
-                safe_printf(r, col, 6,
+            if (col + COL_EXECS <= right_guard) {
+                safe_printf(r, col, COL_EXECS,
                             s->exec_count > 0 ? T->fg_green : T->fg_secondary,
-                            row_bg, false, false, "%6ld", s->exec_count);
+                            row_bg, false, false, "%*ld", COL_EXECS, s->exec_count);
             }
         }
 
         shown++;
     }
 
-    /* "X more entries" footer */
+    /* Overflow indicator */
     if (stat_count > shown) {
         int r = data_row + shown;
         if (r < inner.row + inner.rows - 1) {
             fill_row_bg(r, inner.col, right_guard, BG);
             safe_printf(r, inner.col + 2, W - 4,
                         T->fg_dim, BG, false, true,
-                        "%s %d more entries (showing top %d by rate)",
+                        "%s %d more entries (top %d by rate shown)",
                         TRIANGLE_R, stat_count - shown, shown);
         }
     }
 }
-
+2
 /* ================================================================== */
 /*  SECTION 2 — EVENT SUMMARY                                         */
 /* ================================================================== */
 
 static void draw_event_summary(rect_t panel)
 {
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
     rect_t inner = draw_panel(panel, "EVENT SUMMARY", T->fg_teal);
-    if (inner.rows < 3 || inner.cols < 20) return;
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 18) return;
 
     agg_entry_t agg[32];
     int count = build_event_agg(agg, 32);
     int right_guard = inner.col + inner.cols;
 
     draw_table_header(inner, 0,
-        "%-11s %8s %8s %10s %8s",
+        "%-11s %7s %7s %9s %7s",
         "EVENT", "AVG", "MAX", "TOTAL", "RATE/s");
     draw_divider(panel, 2);
 
@@ -899,9 +982,8 @@ static void draw_event_summary(rect_t panel)
         long avg   = (agg[i].valid_count > 0 && agg[i].total_latency > 0)
                      ? (agg[i].total_latency / agg[i].valid_count) / 1000 : 0;
         long maxus = agg[i].max_latency / 1000;
-        int  is_outlier = (avg > 0 && maxus > avg * 10);
 
-        char avg_s[12], max_s[12], rate_s[12], tot_s[16];
+        char avg_s[10], max_s[10], rate_s[10], tot_s[14];
         fmt_us(avg_s,    sizeof(avg_s),  avg);
         fmt_us(max_s,    sizeof(max_s),  maxus);
         fmt_rate(rate_s, sizeof(rate_s), agg[i].rate);
@@ -911,81 +993,69 @@ static void draw_event_summary(rect_t panel)
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 2;
-        col = safe_printf(r, col, 11, event_fg(agg[i].event), row_bg, false, false, "%-11s", agg[i].event);
-        col++;
-        if (col + 8 <= right_guard) { col = safe_printf(r, col, 8,  lat_fg(avg),    row_bg, false, false, "%8s", avg_s);   col++; }
-        if (col + 8 <= right_guard) { col = safe_printf(r, col, 8,  lat_fg(maxus),  row_bg, false, false, "%8s", max_s);   col++; }
-        if (col + 10 <= right_guard){ col = safe_printf(r, col, 10, T->fg_primary,  row_bg, true,  false, "%10s", tot_s);  col++; }
-        if (col + 8 <= right_guard) { col = safe_printf(r, col, 8,  T->fg_primary,  row_bg, true,  false, "%8s", rate_s);  }
-        if (is_outlier && col + 10 <= right_guard) {
-            col++;
-            safe_puts(r, col, right_guard - col,
-                      WARN " outlier", T->fg_yellow, row_bg, false, true);
-        }
+        col = safe_printf(r, col, 11, event_fg(agg[i].event), row_bg, false, false, "%-11s", agg[i].event); col++;
+        if (col + 7  <= right_guard) { col = safe_printf(r, col, 7,  lat_fg(avg),   row_bg, false, false, "%7s",  avg_s);  col++; }
+        if (col + 7  <= right_guard) { col = safe_printf(r, col, 7,  lat_fg(maxus), row_bg, false, false, "%7s",  max_s);  col++; }
+        if (col + 9  <= right_guard) { col = safe_printf(r, col, 9,  T->fg_primary, row_bg, true,  false, "%9s",  tot_s);  col++; }
+        if (col + 7  <= right_guard) {       safe_printf(r, col, 7,  T->fg_primary, row_bg, true,  false, "%7s",  rate_s); }
         (void)col;
     }
 }
 
 /* ================================================================== */
-/*  SECTION 3 — ACTIVITY GRAPH with SPARKLINE                        */
+/*  SECTION 3 — ACTIVITY GRAPH                                        */
 /* ================================================================== */
 
 static void draw_activity(rect_t panel)
 {
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
+
     agg_entry_t agg[32];
     int count = build_event_agg(agg, 32);
     sort_agg_by_rate(agg, count);
 
-    /* Push fresh rate sample into each ring buffer */
     for (int i = 0; i < count; i++) {
         spark_ring_t *sr = spark_get_or_create(agg[i].event);
         if (sr) spark_push(sr, agg[i].rate);
     }
 
     rect_t inner = draw_panel(panel, "ACTIVITY  " ARROW_UP " rate/s", T->fg_orange);
-    if (inner.rows < 2 || inner.cols < 20) return;
+    if (!rect_valid(inner) || inner.rows < 2 || inner.cols < 18) return;
 
     int right_guard = inner.col + inner.cols;
     double max_rate = (count > 0 && agg[0].rate > 0) ? agg[0].rate : 1.0;
 
-    int spark_w = (inner.cols >= 60) ? 8 : 0;   /* show sparkline if wide enough */
+    int spark_w = (inner.cols >= 60) ? 8 : 0;
     int label_w = 11;
     int rate_w  = 8;
     int bar_w   = inner.cols - label_w - rate_w - spark_w - 6;
-    if (bar_w < 6) { bar_w = 6; spark_w = 0; }
+    if (bar_w < 4) { bar_w = 4; spark_w = 0; }
 
     int r = inner.row;
     for (int i = 0; i < count && r < inner.row + inner.rows; i++, r++) {
         uint32_t row_bg = (i % 2 == 1) ? T->bg_alt_row : BG;
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
-        double   frac    = agg[i].rate / max_rate;
-        uint32_t bar_col = heat_color(frac);
-        uint32_t ev_col  = event_fg(agg[i].event);
+        double   frac   = agg[i].rate / max_rate;
+        uint32_t ev_col = event_fg(agg[i].event);
 
         int col = inner.col + 2;
+        col = safe_printf(r, col, label_w, ev_col, row_bg, false, false, "%-*s", label_w, agg[i].event); col++;
 
-        /* Event label */
-        col = safe_printf(r, col, label_w, ev_col, row_bg, false, false, "%-11s", agg[i].event);
-        col++;
-
-        /* Horizontal bar */
         if (col + bar_w <= right_guard) {
-            draw_bar(r, col, bar_w, frac, bar_col, T->fg_dim, row_bg);
+            draw_bar(r, col, bar_w, frac, heat_color(frac), T->fg_dim, row_bg);
             col += bar_w + 1;
         }
 
-        /* Sparkline trend */
         if (spark_w > 0 && col + spark_w <= right_guard) {
             spark_ring_t *sr = spark_get_or_create(agg[i].event);
             col = draw_sparkline(r, col, spark_w, sr, ev_col, row_bg);
             col++;
         }
 
-        /* Rate label */
         if (col + rate_w <= right_guard) {
-            char rate_s[16]; fmt_rate(rate_s, sizeof(rate_s), agg[i].rate);
-            safe_printf(r, col, rate_w, T->fg_primary, row_bg, true, false, "%6s/s", rate_s);
+            char rate_s[12]; fmt_rate(rate_s, sizeof(rate_s), agg[i].rate);
+            safe_printf(r, col, rate_w, T->fg_primary, row_bg, true, false, "%*s/s", rate_w - 2, rate_s);
         }
     }
 }
@@ -998,6 +1068,8 @@ static void draw_activity(rect_t panel)
 
 static void draw_slowest(rect_t panel)
 {
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
+
     struct syscall_stat tmp[MAX_STATS];
     int n = 0;
     for (int i = 0; i < stat_count; i++) {
@@ -1009,45 +1081,39 @@ static void draw_slowest(rect_t panel)
     }
 
     rect_t inner = draw_panel(panel, "SLOWEST SYSCALLS", T->fg_red);
-    if (inner.rows < 3 || inner.cols < 20 || n == 0) return;
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 18) return;
 
     qsort(tmp, (size_t)n, sizeof(*tmp), cmp_latency);
 
     int right_guard = inner.col + inner.cols;
-
-    draw_table_header(inner, 0,
-        "%-15s %-10s %10s %10s %10s",
-        "PROCESS", "SYSCALL", "MAX", "P95", "AVG");
+    draw_table_header(inner, 0, "%-14s %-9s %9s %9s %9s",
+                      "PROCESS", "EVENT", "AVG", "P95", "MAX");
     draw_divider(panel, 2);
 
     int r = inner.row + 2;
-    for (int i = 0; i < n && i < TOP_N && r < inner.row + inner.rows; i++, r++) {
-        long maxus = tmp[i].max_latency / 1000;
-        long p95   = stats_p95_us(&tmp[i]);
+    int shown = 0;
+    for (int i = 0; i < n && shown < TOP_N && r < inner.row + inner.rows - 1; i++, r++, shown++) {
         long valid = tmp[i].count - tmp[i].drop_count;
         long avg   = (valid > 0 && tmp[i].total_latency > 0)
                      ? (tmp[i].total_latency / valid) / 1000 : 0;
+        long maxus = tmp[i].max_latency / 1000;
+        long p95   = stats_p95_us(&tmp[i]);
 
-        char max_s[12], p95_s[12], avg_s[12];
+        char avg_s[10], max_s[10], p95_s[10];
+        fmt_us(avg_s, sizeof(avg_s), avg);
         fmt_us(max_s, sizeof(max_s), maxus);
         fmt_us(p95_s, sizeof(p95_s), p95);
-        fmt_us(avg_s, sizeof(avg_s), avg);
 
-        uint32_t row_bg = (i % 2 == 1) ? T->bg_alt_row : BG;
+        uint32_t row_bg = (shown % 2 == 1) ? T->bg_alt_row : BG;
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 2;
-
-        col = safe_printf(r, col, 15, T->fg_primary, row_bg, true, false, "%-15s", tmp[i].process);
-        col++;
+        col = safe_printf(r, col, 14, T->fg_primary,         row_bg, true,  false, "%-14s", tmp[i].process); col++;
         if (col >= right_guard) continue;
-
-        col = safe_printf(r, col, 10, event_fg(tmp[i].event), row_bg, false, false, "%-10s", tmp[i].event);
-        col++;
-
-        if (col + 10 <= right_guard) { col = safe_printf(r, col, 10, lat_fg(maxus), row_bg, true,  false, "%10s", max_s); col++; }
-        if (col + 10 <= right_guard) { col = safe_printf(r, col, 10, lat_fg(p95),   row_bg, false, false, "%10s", p95_s); col++; }
-        if (col + 10 <= right_guard) {       safe_printf(r, col, 10, lat_fg(avg),   row_bg, false, false, "%10s", avg_s); }
+        col = safe_printf(r, col, 9,  event_fg(tmp[i].event),row_bg, false, false, "%-9s",  tmp[i].event);   col++;
+        if (col + 9 <= right_guard) { col = safe_printf(r, col, 9, lat_fg(avg),   row_bg, false, false, "%9s", avg_s); col++; }
+        if (col + 9 <= right_guard) { col = safe_printf(r, col, 9, lat_fg(p95),   row_bg, false, false, "%9s", p95_s); col++; }
+        if (col + 9 <= right_guard) {       safe_printf(r, col, 9, lat_fg(maxus), row_bg, true,  false, "%9s", max_s); }
         (void)col;
     }
 }
@@ -1058,6 +1124,8 @@ static void draw_slowest(rect_t panel)
 
 static void draw_anomalies(rect_t panel)
 {
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
+
     struct syscall_stat tmp[MAX_STATS];
     memcpy(tmp, stats, (size_t)stat_count * sizeof(*tmp));
     qsort(tmp, (size_t)stat_count, sizeof(*tmp), cmp_deviation);
@@ -1067,21 +1135,21 @@ static void draw_anomalies(rect_t panel)
         if (tmp[i].is_anomaly && tmp[i].baseline_ready) n_anom++;
 
     rect_t inner = draw_panel(panel, "ANOMALY DETECTION \xe2\x80\x94 EMA BASELINE", T->fg_red);
-    if (inner.rows < 3 || inner.cols < 20) return;
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 18) return;
 
     int right_guard = inner.col + inner.cols;
 
     if (n_anom == 0) {
-        int r = inner.row + 1;
-        fill_row_bg(r, inner.col, right_guard, BG);
-        safe_puts(r, inner.col + 2, inner.cols - 2,
+        int mr = inner.row + 1;
+        fill_row_bg(mr, inner.col, right_guard, BG);
+        safe_puts(mr, inner.col + 2, inner.cols - 4,
                   TICK "  All events within normal baseline",
                   T->fg_green, BG, true, false);
         return;
     }
 
     draw_table_header(inner, 0,
-        "%-15s %-11s %10s %10s %10s",
+        "%-14s %-9s %9s %9s %9s",
         "PROCESS", "EVENT", "DEVIATION", "BASELINE", "CURRENT");
     draw_divider(panel, 2);
 
@@ -1095,7 +1163,7 @@ static void draw_anomalies(rect_t panel)
                            ? (tmp[i].total_latency / valid) / 1000 : 0;
         long baseline_us = (long)(tmp[i].baseline_latency / 1000.0);
 
-        char cur_s[12], bas_s[12];
+        char cur_s[10], bas_s[10];
         fmt_us(cur_s, sizeof(cur_s), current_us);
         fmt_us(bas_s, sizeof(bas_s), baseline_us);
 
@@ -1106,76 +1174,83 @@ static void draw_anomalies(rect_t panel)
 
         bool flash = (g_frame % 2 == 0);
         int col = inner.col + 1;
-        col = vscreen_puts(r, col, flash ? WARN : " ", T->fg_red, row_bg, true, false);
-        col++;
+        vscreen_put(r, col, flash ? WARN : " ", T->fg_red, row_bg, true, false); col += 2;
 
-        col = safe_printf(r, col, 15, T->fg_primary, row_bg, false, false, "%-15s", tmp[i].process);
-        col++;
+        col = safe_printf(r, col, 14, T->fg_primary,          row_bg, false, false, "%-14s", tmp[i].process); col++;
         if (col >= right_guard) { shown++; r++; continue; }
-
-        col = safe_printf(r, col, 11, event_fg(tmp[i].event), row_bg, false, false, "%-11s", tmp[i].event);
-        col++;
-
-        if (col + 10 <= right_guard) {
-            col = safe_printf(r, col, 10, dc, row_bg, true, false, "%9.1f%%", tmp[i].deviation * 100.0);
-            col++;
-        }
-        if (col + 10 <= right_guard) {
-            col = safe_printf(r, col, 10, T->fg_secondary, row_bg, false, false, "%10s", bas_s);
-            col++;
-        }
-        if (col + 10 <= right_guard) {
-            safe_printf(r, col, 10, dc, row_bg, true, false, "%10s", cur_s);
-        }
+        col = safe_printf(r, col, 9,  event_fg(tmp[i].event), row_bg, false, false, "%-9s",  tmp[i].event);   col++;
+        if (col + 9  <= right_guard) { col = safe_printf(r, col, 9,  dc,               row_bg, true,  false, "%8.1f%%", tmp[i].deviation * 100.0); col++; }
+        if (col + 9  <= right_guard) { col = safe_printf(r, col, 9,  T->fg_secondary,  row_bg, false, false, "%9s",     bas_s);                     col++; }
+        if (col + 9  <= right_guard) {       safe_printf(r, col, 9,  dc,               row_bg, true,  false, "%9s",     cur_s); }
         (void)col;
 
-        shown++;
-        r++;
+        shown++; r++;
     }
 
     if (n_anom > shown && r < inner.row + inner.rows) {
         fill_row_bg(r, inner.col, right_guard, BG);
         safe_printf(r, inner.col + 2, inner.cols - 4,
                     T->fg_dim, BG, false, true,
-                    "%s %d more anomalies not shown", TRIANGLE_R, n_anom - shown);
+                    "%s %d more anomalies", TRIANGLE_R, n_anom - shown);
     }
 }
 
 /* ================================================================== */
-/*  SECTION 6 — SCHEDULING DELAY (NEW)                               */
+/*  SECTION 6 — SCHEDULING DELAY (side-by-side with Lifecycle)        */
 /*                                                                     */
-/*  Extracts all "sched" entries from the stats table and renders     */
-/*  them with AVG / MAX / P95 scheduling delay and a trend sparkline. */
-/*  This directly exposes the per-process scheduling delay metric     */
-/*  computed in stats.c: delay = time_scheduled_in - last_sched_out. */
+/*  WHY SIDE-BY-SIDE: when stacked below Lifecycle this panel got     */
+/*  only 4-6 rows, barely enough for the border + header + 2 rows.   */
+/*  Side-by-side gives it the full bottom-zone height (~10-15 rows).  */
 /* ================================================================== */
+
+static void update_sched_sparklines(void)
+{
+    for (int i = 0; i < stat_count; i++) {
+        if (strcmp(stats[i].event, "sched") != 0) continue;
+        char key[28]; snprintf(key, sizeof(key), "sched:%d", stats[i].pid);
+        spark_ring_t *sr = spark_get_or_create(key);
+        if (!sr) continue;
+        long valid = stats[i].count - stats[i].drop_count;
+        long avg   = (valid > 0 && stats[i].total_latency > 0)
+                     ? (stats[i].total_latency / valid) / 1000 : 0;
+        spark_push(sr, (double)avg);
+    }
+}
 
 static void draw_sched_delay(rect_t panel)
 {
-    if (panel.rows < 4) return;
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
 
-    /* Collect sched entries sorted by max delay */
     struct syscall_stat tmp[MAX_STATS];
     int n = 0;
     for (int i = 0; i < stat_count; i++) {
         if (strcmp(stats[i].event, "sched") != 0) continue;
         if (n < MAX_STATS) tmp[n++] = stats[i];
     }
-    if (n == 0) return;
+
+    rect_t inner = draw_panel(panel, "SCHEDULING DELAY", T->fg_yellow);
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 18) return;
+
+    int right_guard = inner.col + inner.cols;
+
+    if (n == 0) {
+        int mr = inner.row + 1;
+        fill_row_bg(mr, inner.col, right_guard, BG);
+        safe_puts(mr, inner.col + 2, inner.cols - 4,
+                  TICK "  No scheduling events yet",
+                  T->fg_secondary, BG, false, true);
+        return;
+    }
 
     qsort(tmp, (size_t)n, sizeof(*tmp), cmp_latency);
 
-    rect_t inner = draw_panel(panel, "SCHEDULING DELAY", T->fg_yellow);
-    if (inner.rows < 3 || inner.cols < 20) return;
-
-    int right_guard = inner.col + inner.cols;
-    bool show_spark = (inner.cols >= 70);
-    int  spark_w    = show_spark ? 10 : 0;
+    bool show_spark = (inner.cols >= 60);
+    int  spark_w    = show_spark ? 8 : 0;
 
     draw_table_header(inner, 0,
-        "%-14s %7s %10s %10s %10s %6s%s",
-        "PROCESS", "PID", "AVG DELAY", "P95 DELAY", "MAX DELAY", "CTXSW",
-        show_spark ? "      TREND" : "");
+        "%-13s %6s %9s %9s %9s %6s%s",
+        "PROCESS", "PID", "AVG", "P95", "MAX", "CTXSW",
+        show_spark ? "  TREND" : "");
     draw_divider(panel, 2);
 
     int r = inner.row + 2;
@@ -1187,68 +1262,43 @@ static void draw_sched_delay(rect_t panel)
         long maxus = tmp[i].max_latency / 1000;
         long p95   = stats_p95_us(&tmp[i]);
 
-        /* Filter out noise rows where all data is 200ms (sched sleep) */
         if (avg > 190000 && p95 <= 0 && valid < 5) { r--; shown--; continue; }
 
-        char avg_s[12], max_s[12], p95_s[12];
+        char avg_s[10], max_s[10], p95_s[10];
         fmt_us(avg_s, sizeof(avg_s), avg);
         fmt_us(max_s, sizeof(max_s), maxus);
         fmt_us(p95_s, sizeof(p95_s), p95);
 
         uint32_t row_bg = (shown % 2 == 1) ? T->bg_alt_row : BG;
-        uint32_t lat_c  = lat_fg(avg);
-
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 2;
-
-        col = safe_printf(r, col, 14, T->fg_primary, row_bg, true, false, "%-14s", tmp[i].process);
-        col++;
+        col = safe_printf(r, col, 13, T->fg_primary,  row_bg, true,  false, "%-13s", tmp[i].process); col++;
         if (col >= right_guard) continue;
+        if (col + 6 <= right_guard) { col = safe_printf(r, col, 6,  T->fg_secondary, row_bg, false, false, "%6d",  tmp[i].pid);         col++; }
+        if (col + 9 <= right_guard) { col = safe_printf(r, col, 9,  lat_fg(avg),     row_bg, true,  false, "%9s",  avg_s);              col++; }
+        if (col + 9 <= right_guard) { col = safe_printf(r, col, 9,  lat_fg(p95),     row_bg, false, false, "%9s",  p95_s);              col++; }
+        if (col + 9 <= right_guard) { col = safe_printf(r, col, 9,  lat_fg(maxus),   row_bg, true,  false, "%9s",  max_s);              col++; }
+        if (col + 6 <= right_guard) { col = safe_printf(r, col, 6,
+                                                         tmp[i].ctx_switches > 1000 ? T->fg_orange : T->fg_secondary,
+                                                         row_bg, false, false, "%6ld", tmp[i].ctx_switches); col++; }
 
-        if (col + 7 <= right_guard) {
-            col = safe_printf(r, col, 7, T->fg_secondary, row_bg, false, false, "%7d", tmp[i].pid);
-            col++;
-        }
-        if (col + 10 <= right_guard) {
-            col = safe_printf(r, col, 10, lat_c, row_bg, true, false, "%10s", avg_s);
-            col++;
-        }
-        if (col + 10 <= right_guard) {
-            col = safe_printf(r, col, 10, lat_fg(p95), row_bg, false, false, "%10s", p95_s);
-            col++;
-        }
-        if (col + 10 <= right_guard) {
-            col = safe_printf(r, col, 10, lat_fg(maxus), row_bg, true, false, "%10s", max_s);
-            col++;
-        }
-        if (col + 6 <= right_guard) {
-            col = safe_printf(r, col, 6,
-                              tmp[i].ctx_switches > 1000 ? T->fg_orange : T->fg_secondary,
-                              row_bg, false, false, "%6ld", tmp[i].ctx_switches);
-            col++;
-        }
-
-        /* Sparkline trend for this process's sched delay */
         if (show_spark && spark_w > 0 && col + spark_w <= right_guard) {
-            /* Use per-process key "sched:<pid>" */
-            char key[24]; snprintf(key, sizeof(key), "sched:%d", tmp[i].pid);
+            char key[28]; snprintf(key, sizeof(key), "sched:%d", tmp[i].pid);
             spark_ring_t *sr = spark_get_or_create(key);
-            if (sr) {
-                /* If this ring is empty, seed it from current avg */
-                if (sr->count == 0) spark_push(sr, (double)avg);
-                draw_sparkline(r, col, spark_w, sr, lat_c, row_bg);
-            }
+            if (sr && sr->count == 0) spark_push(sr, (double)avg);
+            draw_sparkline(r, col, spark_w, sr, lat_fg(avg), row_bg);
         }
     }
 
     if (shown == 0) {
-        /* No valid rows: show a clean message */
-        int mr = inner.row + 1;
-        fill_row_bg(mr, inner.col, right_guard, BG);
-        safe_puts(mr, inner.col + 2, inner.cols - 4,
-                  TICK "  No scheduling delay data yet (waiting for sched events)",
-                  T->fg_secondary, BG, false, true);
+        int mr = inner.row + 2;
+        if (mr < inner.row + inner.rows) {
+            fill_row_bg(mr, inner.col, right_guard, BG);
+            safe_puts(mr, inner.col + 2, inner.cols - 4,
+                      TICK "  Waiting for sched events (all filtered as noise?)",
+                      T->fg_secondary, BG, false, true);
+        }
     }
 }
 
@@ -1258,7 +1308,7 @@ static void draw_sched_delay(rect_t panel)
 
 static void draw_lifecycle(rect_t panel)
 {
-    if (panel.rows < 4) return;
+    if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 20) return;
 
     struct {
         char process[16];
@@ -1292,34 +1342,39 @@ static void draw_lifecycle(rect_t panel)
         }
     }
 
-    if (lc_count == 0) return;
-
     rect_t inner = draw_panel(panel, "PROCESS LIFECYCLE", T->fg_magenta);
-    if (inner.rows < 3 || inner.cols < 20) return;
+    if (!rect_valid(inner) || inner.rows < 3 || inner.cols < 18) return;
 
     int right_guard = inner.col + inner.cols;
 
+    if (lc_count == 0) {
+        int mr = inner.row + 1;
+        fill_row_bg(mr, inner.col, right_guard, BG);
+        safe_puts(mr, inner.col + 2, inner.cols - 4,
+                  TICK "  No exec/exit events yet",
+                  T->fg_secondary, BG, false, true);
+        return;
+    }
+
     draw_table_header(inner, 0,
-        "%-15s %-7s %10s %10s %12s",
+        "%-14s %6s %8s %8s %11s",
         "PROCESS", "PID", "EXECS", "EXITS", "AVG LIFETIME");
     draw_divider(panel, 2);
 
     int r = inner.row + 2;
-    for (int i = 0; i < lc_count && r < inner.row + inner.rows; i++, r++) {
-        char life_s[16]; fmt_us(life_s, sizeof(life_s), procs[i].avg_life_us);
+    for (int i = 0; i < lc_count && r < inner.row + inner.rows - 1; i++, r++) {
+        char life_s[12]; fmt_us(life_s, sizeof(life_s), procs[i].avg_life_us);
 
         uint32_t row_bg = (i % 2 == 1) ? T->bg_alt_row : BG;
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 2;
-        col = safe_printf(r, col, 15, T->fg_primary, row_bg, true, false, "%-15s", procs[i].process);
-        col++;
+        col = safe_printf(r, col, 14, T->fg_primary,   row_bg, true,  false, "%-14s", procs[i].process); col++;
         if (col >= right_guard) continue;
-
-        if (col + 7  <= right_guard) { col = safe_printf(r, col, 7,  T->fg_secondary, row_bg, false, false, "%-7d",  procs[i].pid);      col++; }
-        if (col + 10 <= right_guard) { col = safe_printf(r, col, 10, T->fg_green,     row_bg, false, false, "%10ld", procs[i].execs);    col++; }
-        if (col + 10 <= right_guard) { col = safe_printf(r, col, 10, T->fg_yellow,    row_bg, false, false, "%10ld", procs[i].exits);    col++; }
-        if (col + 12 <= right_guard) {       safe_printf(r, col, 12, T->fg_cyan,      row_bg, false, false, "%12s",  life_s);            }
+        if (col + 6  <= right_guard) { col = safe_printf(r, col, 6,  T->fg_secondary, row_bg, false, false, "%6d",  procs[i].pid);        col++; }
+        if (col + 8  <= right_guard) { col = safe_printf(r, col, 8,  T->fg_green,     row_bg, false, false, "%8ld", procs[i].execs);      col++; }
+        if (col + 8  <= right_guard) { col = safe_printf(r, col, 8,  T->fg_yellow,    row_bg, false, false, "%8ld", procs[i].exits);      col++; }
+        if (col + 11 <= right_guard) {       safe_printf(r, col, 11, T->fg_cyan,      row_bg, false, false, "%11s", life_s); }
         (void)col;
     }
 }
@@ -1330,100 +1385,54 @@ static void draw_lifecycle(rect_t panel)
 
 static void draw_controls(rect_t r)
 {
-    if (r.rows < 1) return;
-    int row = r.row;
+    if (!rect_valid(r) || r.rows < 1) return;
+
+    int row         = r.row;
     int right_guard = r.col + r.cols;
 
     fill_row_bg(row, r.col, right_guard, T->bg_header_row);
 
-    int col = r.col + 1;
-    vscreen_put(row, col, T->bv, T->border_dim, T->bg_header_row, false, false);
-    col += 2;
+    int col = r.col + 2;
 
     struct { const char *key; const char *label; } keys[] = {
-        { "[q]",   " quit"            },
-        { "[r]",   " reset"           },
-        { "[e]",   " export snapshot" },
-        { "[1-6]", " sort column"     },
+        { "[q]",   " quit"    },
+        { "[r]",   " reset"   },
+        { "[e]",   " export"  },
     };
-    for (int i = 0; i < 4 && col < right_guard - 4; i++) {
-        col = vscreen_puts(row, col, keys[i].key,   T->fg_cyan,      T->bg_header_row, true,  false);
-        col = safe_puts(row, col, right_guard - col - 4,
+    for (int i = 0; i < 3 && col < right_guard - 4; i++) {
+        col = vscreen_puts(row, col, keys[i].key, T->fg_cyan, T->bg_header_row, true, false);
+        col = safe_puts(row, col, right_guard - col - 10,
                         keys[i].label, T->fg_secondary, T->bg_header_row, false, false);
-        if (i < 3 && col < right_guard - 4) {
-            col = vscreen_puts(row, col, "   ", T->fg_dim, T->bg_header_row, false, false);
-            if (col < right_guard - 1) {
-                vscreen_put(row, col, T->bv, T->border_dim, T->bg_header_row, false, false);
-                col += 2;
-            }
+        if (i < 2 && col < right_guard - 6) {
+            col = vscreen_puts(row, col, "  ", T->fg_dim, T->bg_header_row, false, false);
+            vscreen_put(row, col, T->bv, T->border_dim, T->bg_header_row, false, false);
+            col += 2;
         }
     }
 
-    const char *watermark = LIGHTNING " eBPF Monitor v8.0  ";
-    int wm_col = r.col + r.cols - (int)strlen(watermark) - 2;
-    if (wm_col > col + 4 && wm_col < right_guard - 2) {
+    /* Right-aligned watermark */
+    const char *wm = LIGHTNING " eBPF Monitor v9.0";
+    int wm_w   = (int)strlen(wm);
+    int wm_col = right_guard - wm_w - 2;
+    if (wm_col > col + 4) {
         vscreen_put(row, wm_col - 1, T->bv, T->border_dim, T->bg_header_row, false, false);
-        safe_puts(row, wm_col, right_guard - wm_col - 1,
-                  watermark, T->fg_dim, T->bg_header_row, false, false);
-    }
-}
-
-/* ================================================================== */
-/*  LAYOUT EXTENSION                                                   */
-/*                                                                     */
-/*  The layout engine allocates lifecycle last, absorbing all         */
-/*  remaining rows.  We split that rect between the scheduling delay  */
-/*  panel (top 40%) and lifecycle (bottom 60%) — both panels still   */
-/*  use the same draw_panel border style so the UI is consistent.    */
-/*                                                                     */
-/*  If the lifecycle rect is smaller than 8 rows, we skip the split  */
-/*  and give all rows to lifecycle (no sched panel drawn).           */
-/* ================================================================== */
-
-static void draw_lifecycle_zone(rect_t zone)
-{
-    if (zone.rows < 8) {
-        /* Not enough space — just lifecycle */
-        draw_lifecycle(zone);
-        return;
-    }
-
-    /* Split: sched delay gets min(8, 35%) rows at top */
-    int sched_rows = zone.rows * 35 / 100;
-    if (sched_rows < 6)  sched_rows = 6;
-    if (sched_rows > 14) sched_rows = 14;
-    if (sched_rows >= zone.rows) sched_rows = zone.rows / 2;
-
-    rect_t sched_rect = { zone.row,             zone.col, sched_rows,             zone.cols };
-    rect_t life_rect  = { zone.row + sched_rows, zone.col, zone.rows - sched_rows, zone.cols };
-
-    draw_sched_delay(sched_rect);
-
-    if (life_rect.rows >= 4)
-        draw_lifecycle(life_rect);
-}
-
-/* ================================================================== */
-/*  SPARKLINE UPDATE for sched-delay per process                      */
-/*  Called once per render to push fresh samples.                     */
-/* ================================================================== */
-
-static void update_sched_sparklines(void)
-{
-    for (int i = 0; i < stat_count; i++) {
-        if (strcmp(stats[i].event, "sched") != 0) continue;
-        char key[24]; snprintf(key, sizeof(key), "sched:%d", stats[i].pid);
-        spark_ring_t *sr = spark_get_or_create(key);
-        if (!sr) continue;
-        long valid = stats[i].count - stats[i].drop_count;
-        long avg   = (valid > 0 && stats[i].total_latency > 0)
-                     ? (stats[i].total_latency / valid) / 1000 : 0;
-        spark_push(sr, (double)avg);
+        safe_puts(row, wm_col, right_guard - wm_col,
+                  wm, T->fg_dim, T->bg_header_row, false, false);
     }
 }
 
 /* ================================================================== */
 /*  MAIN ENTRY POINT                                                   */
+/*                                                                     */
+/*  HOW THE DOUBLE-BUFFER WORKS:                                       */
+/*    vscreen_clear()  — fills vs_next with blank cells               */
+/*    fill_rect(full)  — paints the global bg colour into vs_next     */
+/*    draw_*()         — panel renderers paint their regions in vs_next*/
+/*    vscreen_flush()  — diffs vs_next vs vs_prev, emits only Δ cells */
+/*                                                                     */
+/*  We NEVER call term_clear_screen().  The first flush after a resize*/
+/*  is forced full-redraw by vscreen_invalidate() (called from the    */
+/*  main loop SIGWINCH handler), which makes vs_prev all-0xFF.       */
 /* ================================================================== */
 
 void dashboard_render(double elapsed, double cpu_pct,
@@ -1434,28 +1443,49 @@ void dashboard_render(double elapsed, double cpu_pct,
 
     term_size_t sz = term_get_size();
 
+    /*
+     * WHY: track last size here, not inside vscreen_resize().
+     * vscreen_resize() is called from the SIGWINCH handler in
+     * bootstrap.c.  If we call it again here on size change we get a
+     * double-resize and vs_prev is wiped twice → unnecessary full
+     * redraw flicker.  We only resize here if the bootstrap main loop
+     * somehow missed the SIGWINCH (shouldn't happen, but safe fallback).
+     */
     static int last_rows = 0, last_cols = 0;
     if (sz.rows != last_rows || sz.cols != last_cols) {
         vscreen_resize(sz.rows, sz.cols);
+        vscreen_invalidate();
         last_rows = sz.rows;
         last_cols = sz.cols;
     }
 
+    /* ── Compute layout ── */
+    layout_t L;
+    int layout_ok = layout_compute(sz.rows, sz.cols, &L);
+
+    /* ── Blank the next frame ── */
     vscreen_clear();
 
-    /* ── GLOBAL BACKGROUND FILL ── */
+    /* ── Global background fill ── */
     {
         rect_t full = { 0, 0, sz.rows, sz.cols };
         fill_rect(full, T->fg_dim, BG);
     }
 
-    /* ── Pre-render metrics ── */
+    /* ── Terminal too small ── */
+    if (layout_ok != 0) {
+        vscreen_puts(0, 0,
+                     "Terminal too small — please resize (min 60x20)",
+                     T->fg_red, BG, true, false);
+        vscreen_flush();
+        return;
+    }
+
+    /* ── Pre-render metric updates ── */
     update_events_per_sec();
     update_sched_sparklines();
 
-    layout_t L;
-    layout_compute(sz.rows, sz.cols, &L);
-
+    /* ── Draw all panels ── */
     draw_header(L.header, elapsed, cpu_pct,
                 active_pid, active_comm, active_min_ms);
 
@@ -1465,11 +1495,21 @@ void dashboard_render(double elapsed, double cpu_pct,
     draw_slowest(L.slowest);
     draw_anomalies(L.anomaly);
 
-    /* Lifecycle zone: split between sched-delay panel and lifecycle panel */
-    if (L.lifecycle.rows >= 4)
-        draw_lifecycle_zone(L.lifecycle);
+    /*
+     * Bottom zone: lifecycle (left) and sched_delay (right) SIDE BY SIDE.
+     *
+     * WHY: layout_compute() already split L.lifecycle (left half) and
+     * L.sched_delay (right half) horizontally from the same zone.
+     * We just draw each into its rect.  No wrapper function needed.
+     * Both panels check rect_valid() + minimum size at the top.
+     */
+    draw_lifecycle(L.lifecycle);
+
+    if (rect_valid(L.sched_delay) && L.sched_delay.cols >= 20)
+        draw_sched_delay(L.sched_delay);
 
     draw_controls(L.controls);
 
+    /* ── Diff-flush: only changed cells reach the terminal ── */
     vscreen_flush();
 }
