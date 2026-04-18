@@ -127,26 +127,65 @@ static void sig_winch(int sig)
 static struct rusage cpu_baseline;
 static time_t        cpu_wall_start;
 
+static bool          cpu_interval_reset_pending = false;
+
 static void cpu_baseline_reset(void)
 {
     getrusage(RUSAGE_SELF, &cpu_baseline);
     cpu_wall_start = time(NULL);
+    /* Signal cpu_overhead_pct() to discard its stale interval snapshot. */
+    cpu_interval_reset_pending = true;
 }
 
+/*
+ * cpu_overhead_pct — per-interval CPU usage of this process.
+ *
+ * WHY PER-INTERVAL instead of cumulative:
+ *   The cumulative approach divides total CPU time since startup by total
+ *   wall time since startup.  Early in the run (< a few seconds) the BPF
+ *   attach and libbpf init cost dominates and produces 80-100%.  Even at
+ *   steady state, cumulative averaging hides the current load — a spike
+ *   30 minutes ago still drags the number up.
+ *
+ *   Per-interval: snapshot rusage on every call, diff against the previous
+ *   snapshot over the elapsed wall time between calls.  This gives the CPU
+ *   fraction consumed in the last render interval (nominally 2 seconds),
+ *   which is what the user actually cares about.
+ *
+ *   Guard: if wall_s < 0.1 (first call or clock jump) return 0.0.
+ *   Guard: clamp to [0, 100].
+ */
 static double cpu_overhead_pct(void)
 {
+    static struct rusage ru_prev      = {{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0}};
+    static time_t        wall_prev    = 0;
+    static bool          initialized  = false;
+
     struct rusage ru_now;
     if (getrusage(RUSAGE_SELF, &ru_now) != 0) return 0.0;
+    time_t wall_now = time(NULL);
 
-    double wall_s = difftime(time(NULL), cpu_wall_start);
-    if (wall_s < 1.0) return 0.0;
+    if (!initialized || cpu_interval_reset_pending) {
+        ru_prev                    = ru_now;
+        wall_prev                  = wall_now;
+        initialized                = true;
+        cpu_interval_reset_pending = false;
+        return 0.0;
+    }
+
+    double wall_s = difftime(wall_now, wall_prev);
+    if (wall_s < 0.1) return 0.0;
 
     double used_u =
-        (double)(ru_now.ru_utime.tv_sec  - cpu_baseline.ru_utime.tv_sec)
-      + (double)(ru_now.ru_utime.tv_usec - cpu_baseline.ru_utime.tv_usec) / 1e6;
+        (double)(ru_now.ru_utime.tv_sec  - ru_prev.ru_utime.tv_sec)
+      + (double)(ru_now.ru_utime.tv_usec - ru_prev.ru_utime.tv_usec) / 1e6;
     double used_s =
-        (double)(ru_now.ru_stime.tv_sec  - cpu_baseline.ru_stime.tv_sec)
-      + (double)(ru_now.ru_stime.tv_usec - cpu_baseline.ru_stime.tv_usec) / 1e6;
+        (double)(ru_now.ru_stime.tv_sec  - ru_prev.ru_stime.tv_sec)
+      + (double)(ru_now.ru_stime.tv_usec - ru_prev.ru_stime.tv_usec) / 1e6;
+
+    /* Update snapshot for next call */
+    ru_prev   = ru_now;
+    wall_prev = wall_now;
 
     double pct = ((used_u + used_s) / wall_s) * 100.0;
     if (pct < 0.0)   pct = 0.0;

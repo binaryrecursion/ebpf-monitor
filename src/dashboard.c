@@ -686,21 +686,49 @@ static void draw_header(rect_t r, double elapsed,
 
     /* ── FIXED-WIDTH CLOCK at the right end of the metrics row ──
      *
-     * WHY FIXED: The date+time string "Thu 01 Jan  23:59:59" is always
-     * exactly CLOCK_W characters.  We write it at a fixed column offset
-     * from the right border so it never shifts or collides with metrics.
+     * FIX — CLOCK CORRECTNESS:
+     * 1. Use localtime_r() instead of localtime() — re-entrant, no
+     *    stale pointer from a previous call.
+     * 2. Build the full "Day DD Mon  HH:MM:SS" string in ONE buffer
+     *    and pad/truncate to exactly CLOCK_W cells with safe_puts().
+     *    The old code wrote datebuf at clock_col and timebuf at
+     *    clock_col+9 — but strftime("%a %d %b") can be 9 OR 10 chars
+     *    (e.g. "Sat 18 Apr" = 10) so the time was written 1 col off.
+     * 3. Only update the display when the second changes — prevents
+     *    unnecessary cell diffs and potential visual flicker.
      */
     {
-        time_t     now     = time(NULL);
-        struct tm *tm_info = localtime(&now);
-        char datebuf[16], timebuf[12];
-        strftime(datebuf, sizeof(datebuf), "%a %d %b", tm_info);
-        strftime(timebuf, sizeof(timebuf), " %H:%M:%S", tm_info);
-        /* date (9) + space (1) + time (9) = 19, padded to CLOCK_W */
+        static time_t last_clock_sec = 0;
+        static char   clock_buf[CLOCK_W + 1] = "";
+
+        time_t     now = time(NULL);
+        struct tm  tm_info;
+        localtime_r(&now, &tm_info);
+
+        if (now != last_clock_sec) {
+            /*
+             * Target: "Sat 18 Apr  14:38:56" — exactly CLOCK_W=20 chars.
+             *
+             * "%a %d %b" always produces exactly 10 chars (strftime zero-pads
+             * the day with %d: "Sat 08 Apr").  Two spaces + "%H:%M:%S" (always
+             * 8 chars) = 10 + 2 + 8 = 20 = CLOCK_W exactly.
+             *
+             * We use snprintf with the full buffer size, then hard-clamp at
+             * CLOCK_W to guard against any locale weirdness.
+             */
+            char date_part[12], time_part[10];
+            strftime(date_part, sizeof(date_part), "%a %d %b", &tm_info);
+            strftime(time_part, sizeof(time_part), "%H:%M:%S",  &tm_info);
+            snprintf(clock_buf, sizeof(clock_buf),
+                     "%-10s  %8s", date_part, time_part);
+            clock_buf[CLOCK_W] = '\0';   /* hard clamp — always 20 */
+            last_clock_sec = now;
+        }
+
         int clock_col = right_guard - CLOCK_W;
         if (clock_col > r.col + 2) {
-            vscreen_puts(row, clock_col, datebuf, T->fg_dim,     T->bg_header_row, false, false);
-            vscreen_puts(row, clock_col + 9, timebuf, T->fg_primary, T->bg_header_row, true, false);
+            safe_puts(row, clock_col, CLOCK_W,
+                      clock_buf, T->fg_primary, T->bg_header_row, true, false);
         }
     }
 
@@ -779,18 +807,37 @@ static void draw_header(rect_t r, double elapsed,
 
 #define MAX_DISPLAY 16
 
-/* Fixed column widths for the process table */
-#define COL_PROC   14
-#define COL_EVENT   9
+/*
+ * FIX — COLUMN WIDTHS:
+ * These constants define the EXACT display-cell width of every column
+ * INCLUDING its right-side space gap.  The header and every data row
+ * use the same values, so they are structurally identical.
+ *
+ * Layout (1 space gap between columns):
+ *   [1 anom] [BAR+1] [PROC ] [EVENT] [RATE/s] [AVG] [P95?] [MAX] [PID?] [CTXSW?] [EXECS?]
+ *
+ * Column data widths (NOT including the trailing space separator):
+ *   PROC  16  — left-aligned process name  (was 14, caused "gnome-shell" overflow)
+ *   EVENT  9  — left-aligned event name
+ *   RATE   7  — right-aligned rate string
+ *   AVG    7  — right-aligned avg latency
+ *   P95    7  — right-aligned p95 latency
+ *   MAX    8  — right-aligned max latency
+ *   PID    7  — right-aligned PID (shown >= 80 cols)
+ *   CTXSW  7  — right-aligned ctx switches (was 6, needed for 6-digit numbers)
+ *   EXECS  7  — right-aligned exec count   (was 6)
+ *   BAR    8  — mini rate sparkbar
+ */
+#define COL_PROC   18
+#define COL_EVENT  10
 #define COL_RATE    7
-#define COL_AVG     7
-#define COL_P95     7
-#define COL_MAX     8
-#define COL_PID     7
-#define COL_CTXSW   6
-#define COL_EXECS   6
+#define COL_AVG     8
+#define COL_P95     8
+#define COL_MAX     9
+#define COL_PID     8
+#define COL_CTXSW   7
+#define COL_EXECS   7
 #define COL_BAR     8
-
 static void draw_processes(rect_t panel)
 {
     if (!rect_valid(panel) || panel.rows < 4 || panel.cols < 40) return;
@@ -809,41 +856,118 @@ static void draw_processes(rect_t panel)
     bool show_extra = (W >= 116);
     bool show_bar   = (W >= 70);
 
-    /* Build header string using fixed field widths */
-    char hdr[256] = {0};
+    /* ----------------------------------------------------------------
+     * Build header string.
+     *
+     * FIX — HEADER/DATA ALIGNMENT:
+     * Data rows start at inner.col+1 (anomaly indicator) then +1 for
+     * the indicator cell itself.  The header is rendered by
+     * draw_table_header() which starts at inner.col+2.  So the header
+     * string must begin with the BAR field (no leading space for the
+     * anomaly indicator — that cell is always blank in the header).
+     *
+     * Each column is rendered with %-Ns or %Ns matching the same widths
+     * used in the data rows.  The single space after each safe_printf
+     * col++ matches the separator space in the format string below.
+     * ---------------------------------------------------------------- */
+    /* ----------------------------------------------------------------
+     * Render header row column-by-column, mirroring the EXACT same
+     * col positions used in data rows.  This guarantees pixel-perfect
+     * alignment regardless of which optional columns are shown.
+     *
+     * Data row layout:
+     *   inner.col+1  → 1-cell anomaly indicator  (col++)
+     *   col          → COL_BAR mini-bar           (col += COL_BAR+1, if show_bar)
+     *   col          → COL_PROC process name      (col++)
+     *   col          → COL_EVENT event            (col++)
+     *   col          → COL_RATE  rate/s           (col++)
+     *   col          → COL_AVG   avg              (col++)
+     *   col          → COL_P95   p95              (col++, if show_p95)
+     *   col          → COL_MAX   max              (col++)
+     *   col          → COL_PID   pid              (col++, if show_pid)
+     *   col          → COL_CTXSW ctxsw            (col++, if show_extra)
+     *   col          → COL_EXECS execs            (if show_extra)
+     * ---------------------------------------------------------------- */
     {
-        char *p = hdr;
-        int   rem = (int)sizeof(hdr) - 1;
-        int   n;
+        int hr = inner.row;   /* header is row 0 of inner */
+        fill_row_bg(hr, inner.col, right_guard, T->bg_header_row);
 
-        if (show_bar) {
-            n = snprintf(p, rem, "%*s ", COL_BAR, "RATE\xe2\x96\x84");
-            p += n; rem -= n;
+        int col = inner.col + 1;
+
+        /* Anomaly indicator cell — blank in header */
+        vscreen_put(hr, col, " ", T->fg_secondary, T->bg_header_row, false, false);
+        col++;
+
+        /* BAR column header */
+        if (show_bar && col + COL_BAR + 1 <= right_guard) {
+            safe_printf(hr, col, COL_BAR,
+                        T->fg_secondary, T->bg_header_row, false, false,
+                        "%*s", COL_BAR, "RATE\xe2\x96\x84");
+            col += COL_BAR + 1;
         }
-        n = snprintf(p, rem, "%-*s %-*s %*s %*s",
-                     COL_PROC, "PROCESS", COL_EVENT, "EVENT",
-                     COL_RATE, "RATE/s", COL_AVG, "AVG");
-        p += n; rem -= n;
-        if (show_p95 && rem > 0) {
-            n = snprintf(p, rem, " %*s", COL_P95, "P95");
-            p += n; rem -= n;
+
+        if (col >= right_guard) goto hdr_done;
+
+/*
+ * HDR_COL — write a header label and advance col by exactly `width`+1
+ * (the column data width + 1 separator space), matching what data rows
+ * do: safe_printf(...) returns col+width, then col++ adds the separator.
+ *
+ * We IGNORE the return value of safe_printf and advance col by the
+ * compile-time constant instead.  This is critical: safe_printf calls
+ * vscreen_puts which returns col + cells_actually_rendered.  For ASCII
+ * strings padded by %*s that equals col+width, but we must never rely
+ * on that — advancing by the constant keeps header and data rows
+ * structurally identical regardless of font/cell quirks.
+ */
+#define HDR_COL(width, fmt, label) \
+    do { \
+        safe_printf(hr, col, (width), \
+                    T->fg_secondary, T->bg_header_row, false, false, \
+                    (fmt), (width), (label)); \
+        col += (width) + 1; \
+    } while (0)
+
+        /* PROCESS — left-aligned */
+        HDR_COL(COL_PROC,  "%-*s", "PROCESS");
+        if (col >= right_guard) goto hdr_done;
+
+        /* EVENT — left-aligned */
+        HDR_COL(COL_EVENT, "%-*s", "EVENT");
+
+        /* RATE/s — right-aligned */
+        if (col + COL_RATE + 1 <= right_guard)
+            HDR_COL(COL_RATE, "%*s", "RATE/s");
+
+        /* AVG — right-aligned */
+        if (col + COL_AVG + 1 <= right_guard)
+            HDR_COL(COL_AVG, "%*s", "AVG");
+
+        /* P95 — right-aligned, optional */
+        if (show_p95 && col + COL_P95 + 1 <= right_guard)
+            HDR_COL(COL_P95, "%*s", "P95");
+
+        /* MAX — right-aligned */
+        if (col + COL_MAX + 1 <= right_guard)
+            HDR_COL(COL_MAX, "%*s", "MAX");
+
+        /* PID — right-aligned, optional */
+        if (show_pid && col + COL_PID + 1 <= right_guard)
+            HDR_COL(COL_PID, "%*s", "PID");
+
+        /* CTXSW / EXECS — right-aligned, optional */
+        if (show_extra) {
+            if (col + COL_CTXSW + 1 <= right_guard)
+                HDR_COL(COL_CTXSW, "%*s", "CTXSW");
+            if (col + COL_EXECS <= right_guard)
+                safe_printf(hr, col, COL_EXECS,
+                            T->fg_secondary, T->bg_header_row, false, false,
+                            "%*s", COL_EXECS, "EXECS");
         }
-        if (rem > 0) {
-            n = snprintf(p, rem, " %*s", COL_MAX, "MAX");
-            p += n; rem -= n;
-        }
-        if (show_pid && rem > 0) {
-            n = snprintf(p, rem, " %*s", COL_PID, "PID");
-            p += n; rem -= n;
-        }
-        if (show_extra && rem > 0) {
-            n = snprintf(p, rem, " %*s %*s", COL_CTXSW, "CTXSW", COL_EXECS, "EXECS");
-            p += n; rem -= n;
-        }
-        (void)rem;
+#undef HDR_COL
+        (void)col;
     }
-
-    draw_table_header(inner, 0, "%s", hdr);
+hdr_done:
     draw_divider(panel, 2);
 
     double max_rate = 1.0;
@@ -897,43 +1021,51 @@ static void draw_processes(rect_t panel)
         if (col >= right_guard) { shown++; continue; }
 
         /* PROCESS — left-aligned, fixed width */
-        col = safe_printf(r, col, COL_PROC,  T->fg_primary,       row_bg, true,  false, "%-*s", COL_PROC,  s->process); col++;
+        safe_printf(r, col, COL_PROC, T->fg_primary, row_bg, true, false, "%-*s", COL_PROC, s->process);
+        col += COL_PROC + 1;
         if (col >= right_guard) { shown++; continue; }
 
         /* EVENT */
-        col = safe_printf(r, col, COL_EVENT, event_fg(s->event),  row_bg, false, false, "%-*s", COL_EVENT, s->event);   col++;
+        safe_printf(r, col, COL_EVENT, event_fg(s->event), row_bg, false, false, "%-*s", COL_EVENT, s->event);
+        col += COL_EVENT + 1;
 
         /* RATE/s — right-aligned */
-        if (col + COL_RATE <= right_guard) {
-            col = safe_printf(r, col, COL_RATE, T->fg_primary, row_bg, false, false, "%*s", COL_RATE, rate_s); col++;
+        if (col + COL_RATE + 1 <= right_guard) {
+            safe_printf(r, col, COL_RATE, T->fg_primary, row_bg, false, false, "%*s", COL_RATE, rate_s);
+            col += COL_RATE + 1;
         }
 
         /* AVG */
-        if (col + COL_AVG <= right_guard) {
-            col = safe_printf(r, col, COL_AVG, lat_fg(avg), row_bg, false, false, "%*s", COL_AVG, avg_s); col++;
+        if (col + COL_AVG + 1 <= right_guard) {
+            safe_printf(r, col, COL_AVG, lat_fg(avg), row_bg, false, false, "%*s", COL_AVG, avg_s);
+            col += COL_AVG + 1;
         }
 
         /* P95 */
-        if (show_p95 && col + COL_P95 <= right_guard) {
-            col = safe_printf(r, col, COL_P95, lat_fg(p95), row_bg, false, false, "%*s", COL_P95, p95_s); col++;
+        if (show_p95 && col + COL_P95 + 1 <= right_guard) {
+            safe_printf(r, col, COL_P95, lat_fg(p95), row_bg, false, false, "%*s", COL_P95, p95_s);
+            col += COL_P95 + 1;
         }
 
         /* MAX */
-        if (col + COL_MAX <= right_guard) {
-            col = safe_printf(r, col, COL_MAX, lat_fg(maxus), row_bg, false, false, "%*s", COL_MAX, max_s); col++;
+        if (col + COL_MAX + 1 <= right_guard) {
+            safe_printf(r, col, COL_MAX, lat_fg(maxus), row_bg, false, false, "%*s", COL_MAX, max_s);
+            col += COL_MAX + 1;
         }
 
         /* PID */
-        if (show_pid && col + COL_PID <= right_guard) {
-            col = safe_printf(r, col, COL_PID, T->fg_secondary, row_bg, false, false, "%*d", COL_PID, s->pid); col++;
+        if (show_pid && col + COL_PID + 1 <= right_guard) {
+            safe_printf(r, col, COL_PID, T->fg_secondary, row_bg, false, false, "%*d", COL_PID, s->pid);
+            col += COL_PID + 1;
         }
 
         /* CTXSW / EXECS */
         if (show_extra) {
-            if (col + COL_CTXSW <= right_guard) {
-                col = safe_printf(r, col, COL_CTXSW,
-                                  s->ctx_switches > 0 ? T->fg_yellow : T->fg_secondary,
-                                  row_bg, false, false, "%*ld", COL_CTXSW, s->ctx_switches); col++;
+            if (col + COL_CTXSW + 1 <= right_guard) {
+                safe_printf(r, col, COL_CTXSW,
+                            s->ctx_switches > 0 ? T->fg_yellow : T->fg_secondary,
+                            row_bg, false, false, "%*ld", COL_CTXSW, s->ctx_switches);
+                col += COL_CTXSW + 1;
             }
             if (col + COL_EXECS <= right_guard) {
                 safe_printf(r, col, COL_EXECS,
@@ -957,7 +1089,7 @@ static void draw_processes(rect_t panel)
         }
     }
 }
-2
+
 /* ================================================================== */
 /*  SECTION 2 — EVENT SUMMARY                                         */
 /* ================================================================== */
@@ -972,9 +1104,25 @@ static void draw_event_summary(rect_t panel)
     int count = build_event_agg(agg, 32);
     int right_guard = inner.col + inner.cols;
 
-    draw_table_header(inner, 0,
-        "%-11s %7s %7s %9s %7s",
-        "EVENT", "AVG", "MAX", "TOTAL", "RATE/s");
+    /* Column widths — must match the header format exactly */
+    #define ES_EVENT  11
+    #define ES_AVG     7
+    #define ES_MAX     7
+    #define ES_TOTAL   9
+    #define ES_RATE    7
+
+    /* Header — render column-by-column to match data row positions */
+    {
+        int hr = inner.row;
+        fill_row_bg(hr, inner.col, right_guard, T->bg_header_row);
+        int col = inner.col + 2;
+        safe_printf(hr, col, ES_EVENT, T->fg_secondary, T->bg_header_row, false, false, "%-*s", ES_EVENT, "EVENT");   col += ES_EVENT + 1;
+        if (col + ES_AVG   <= right_guard) { safe_printf(hr, col, ES_AVG,   T->fg_secondary, T->bg_header_row, false, false, "%*s", ES_AVG,   "AVG");    col += ES_AVG   + 1; }
+        if (col + ES_MAX   <= right_guard) { safe_printf(hr, col, ES_MAX,   T->fg_secondary, T->bg_header_row, false, false, "%*s", ES_MAX,   "MAX");    col += ES_MAX   + 1; }
+        if (col + ES_TOTAL <= right_guard) { safe_printf(hr, col, ES_TOTAL, T->fg_secondary, T->bg_header_row, false, false, "%*s", ES_TOTAL, "TOTAL");  col += ES_TOTAL + 1; }
+        if (col + ES_RATE  <= right_guard) { safe_printf(hr, col, ES_RATE,  T->fg_secondary, T->bg_header_row, false, false, "%*s", ES_RATE,  "RATE/s"); }
+        (void)col;
+    }
     draw_divider(panel, 2);
 
     int r = inner.row + 2;
@@ -993,13 +1141,19 @@ static void draw_event_summary(rect_t panel)
         fill_row_bg(r, inner.col, right_guard, row_bg);
 
         int col = inner.col + 2;
-        col = safe_printf(r, col, 11, event_fg(agg[i].event), row_bg, false, false, "%-11s", agg[i].event); col++;
-        if (col + 7  <= right_guard) { col = safe_printf(r, col, 7,  lat_fg(avg),   row_bg, false, false, "%7s",  avg_s);  col++; }
-        if (col + 7  <= right_guard) { col = safe_printf(r, col, 7,  lat_fg(maxus), row_bg, false, false, "%7s",  max_s);  col++; }
-        if (col + 9  <= right_guard) { col = safe_printf(r, col, 9,  T->fg_primary, row_bg, true,  false, "%9s",  tot_s);  col++; }
-        if (col + 7  <= right_guard) {       safe_printf(r, col, 7,  T->fg_primary, row_bg, true,  false, "%7s",  rate_s); }
+        safe_printf(r, col, ES_EVENT, event_fg(agg[i].event), row_bg, false, false, "%-*s", ES_EVENT, agg[i].event); col += ES_EVENT + 1;
+        if (col + ES_AVG   <= right_guard) { safe_printf(r, col, ES_AVG,   lat_fg(avg),   row_bg, false, false, "%*s",  ES_AVG,   avg_s);  col += ES_AVG   + 1; }
+        if (col + ES_MAX   <= right_guard) { safe_printf(r, col, ES_MAX,   lat_fg(maxus), row_bg, false, false, "%*s",  ES_MAX,   max_s);  col += ES_MAX   + 1; }
+        if (col + ES_TOTAL <= right_guard) { safe_printf(r, col, ES_TOTAL, T->fg_primary, row_bg, true,  false, "%*s",  ES_TOTAL, tot_s);  col += ES_TOTAL + 1; }
+        if (col + ES_RATE  <= right_guard) { safe_printf(r, col, ES_RATE,  T->fg_primary, row_bg, true,  false, "%*s",  ES_RATE,  rate_s); }
         (void)col;
     }
+
+    #undef ES_EVENT
+    #undef ES_AVG
+    #undef ES_MAX
+    #undef ES_TOTAL
+    #undef ES_RATE
 }
 
 /* ================================================================== */
