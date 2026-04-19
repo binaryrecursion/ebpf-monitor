@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <argp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -138,32 +140,37 @@ static void cpu_baseline_reset(void)
 }
 
 /*
- * cpu_overhead_pct — per-interval CPU usage of this process.
+ * cpu_overhead_pct — per-interval CPU usage of this process, single-core basis.
  *
- * WHY PER-INTERVAL instead of cumulative:
- *   The cumulative approach divides total CPU time since startup by total
- *   wall time since startup.  Early in the run (< a few seconds) the BPF
- *   attach and libbpf init cost dominates and produces 80-100%.  Even at
- *   steady state, cumulative averaging hides the current load — a spike
- *   30 minutes ago still drags the number up.
+ * SEMANTICS (matching btop++):
+ *   btop shows CPU% as a fraction of ONE core, NOT of total system CPU.
+ *   A process using one full core shows ~100%, regardless of how many cores
+ *   exist.  This is the standard ps/top convention.
  *
- *   Per-interval: snapshot rusage on every call, diff against the previous
- *   snapshot over the elapsed wall time between calls.  This gives the CPU
- *   fraction consumed in the last render interval (nominally 2 seconds),
- *   which is what the user actually cares about.
+ *   Formula: (delta_user + delta_sys) / delta_wall * 100
+ *   No division by nproc — that would give system-wide fraction (wrong).
  *
- *   Guard: if wall_s < 0.1 (first call or clock jump) return 0.0.
- *   Guard: clamp to [0, 100].
+ * WHY clock_gettime instead of time(NULL) for wall_s:
+ *   time(NULL) has 1-second resolution.  When called every 2 render seconds,
+ *   the delta is sometimes 1s and sometimes 2s depending on alignment with
+ *   the clock tick.  A 1s wall_s against 2s of accumulated CPU gives 200%
+ *   before the 100% clamp, making the display spike.  CLOCK_MONOTONIC gives
+ *   microsecond resolution so wall_s is always accurate to the true interval.
+ *
+ * Guard: wall_s < 0.05s → return 0.0 (startup or clock step).
+ * Clamp: [0, 100] — single-core max is 100%.
  */
 static double cpu_overhead_pct(void)
 {
-    static struct rusage ru_prev      = {{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0},{0}};
-    static time_t        wall_prev    = 0;
-    static bool          initialized  = false;
+    static struct rusage    ru_prev     = {{0},{0}};
+    static struct timespec  wall_prev   = {0, 0};
+    static bool             initialized = false;
 
-    struct rusage ru_now;
+    struct rusage   ru_now;
+    struct timespec wall_now;
+
     if (getrusage(RUSAGE_SELF, &ru_now) != 0) return 0.0;
-    time_t wall_now = time(NULL);
+    clock_gettime(CLOCK_MONOTONIC, &wall_now);
 
     if (!initialized || cpu_interval_reset_pending) {
         ru_prev                    = ru_now;
@@ -173,8 +180,9 @@ static double cpu_overhead_pct(void)
         return 0.0;
     }
 
-    double wall_s = difftime(wall_now, wall_prev);
-    if (wall_s < 0.1) return 0.0;
+    double wall_s = (wall_now.tv_sec  - wall_prev.tv_sec)
+                  + (wall_now.tv_nsec - wall_prev.tv_nsec) / 1e9;
+    if (wall_s < 0.05) return 0.0;
 
     double used_u =
         (double)(ru_now.ru_utime.tv_sec  - ru_prev.ru_utime.tv_sec)
@@ -183,10 +191,12 @@ static double cpu_overhead_pct(void)
         (double)(ru_now.ru_stime.tv_sec  - ru_prev.ru_stime.tv_sec)
       + (double)(ru_now.ru_stime.tv_usec - ru_prev.ru_stime.tv_usec) / 1e6;
 
-    /* Update snapshot for next call */
+    /* Update snapshots for next call */
     ru_prev   = ru_now;
     wall_prev = wall_now;
 
+    /* Single-core fraction: matches btop's per-process CPU% convention.
+     * No nproc divisor — 100% = one full core consumed. */
     double pct = ((used_u + used_s) / wall_s) * 100.0;
     if (pct < 0.0)   pct = 0.0;
     if (pct > 100.0) pct = 100.0;

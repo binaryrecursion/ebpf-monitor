@@ -39,10 +39,10 @@
  *     to its slot.  Gaps between columns are exactly 1 space.
  *
  * (F) HEADER
- *     The clock is right-aligned at a FIXED slot: right_guard - CLOCK_W.
- *     CLOCK_W = strlen("Thu 01 Jan  23:59:59") = 20 (constant).
- *     The left-to-right metric stream is allowed to use at most
- *     right_guard - CLOCK_W - 2 cols so the clock never gets overwritten.
+ *     The clock is rendered btop-style: HH:MM:SS centered on the TOP BORDER
+ *     row of the header, wrapped in ┤ / ├ tee decorators.  It occupies exactly
+ *     12 cells (tee + space + 8 chars + space + tee) centered at W/2.
+ *     The metrics stream on row+1 now has the full right_guard width available.
  *
  * (G) BACKGROUND
  *     draw_panel() calls fill_rect() on the full outer rect first, then
@@ -110,8 +110,8 @@ static const char *SPARK[8] = {
     "\xe2\x96\x87",  /* ▇ */
 };
 
-/* Clock field width: "Thu 01 Jan  23:59:59" — always 20 chars */
-#define CLOCK_W 20
+/* Clock field width: "HH:MM:SS" = 8 chars + 2 tees + 2 spaces = 12 cells total (centered) */
+#define CLOCK_DISPLAY_W 12
 
 /* ================================================================== */
 /*  Frame counter                                                      */
@@ -244,7 +244,7 @@ static int safe_puts(int row, int col, int max_cols,
         int bytes = (b & 0x80) == 0x00 ? 1 :
                     (b & 0xE0) == 0xC0 ? 2 :
                     (b & 0xF0) == 0xE0 ? 3 : 4;
-        display_len++;
+        display_len++;  
         p += bytes;
     }
 
@@ -579,12 +579,10 @@ static void draw_table_header(rect_t content, int rel_row,
 /* ================================================================== */
 /*  HEADER BANNER                                                      */
 /*                                                                     */
-/*  FIX — CLOCK:                                                       */
-/*  The clock occupies a FIXED slot at the right end of the metrics   */
-/*  row: cols [right_guard - CLOCK_W, right_guard).                   */
-/*  The left-side metric stream is bounded at (right_guard - CLOCK_W  */
-/*  - 2) so it can never overwrite the clock regardless of how many   */
-/*  metrics are shown.  Clock width is constant = CLOCK_W = 20 chars. */
+/*  CLOCK — btop-style, centered on the top border row:               */
+/*  ┤ HH:MM:SS ├  drawn AFTER the border, so it overwrites the ═══   */
+/*  fill at the center.  The metrics row (row+1) is fully available   */
+/*  for the left-side metric stream up to right_guard.                */
 /* ================================================================== */
 
 static void draw_header(rect_t r, double elapsed,
@@ -613,9 +611,8 @@ static void draw_header(rect_t r, double elapsed,
     vscreen_put(row, r.col + W - 1, T->bdv, T->border_dim, T->bg_header_row, false, false);
 
     int col        = r.col + 2;
-    /* WHY: reserve CLOCK_W + 2 cells on the right so clock never collides */
     int right_guard = r.col + W - 2;
-    int metric_end  = right_guard - CLOCK_W - 2;   /* left stream stops here */
+    int metric_end  = right_guard - 2;   /* leave 2 cells for right border padding */
 
 #define HDR_SEP() \
     do { \
@@ -679,56 +676,60 @@ static void draw_header(rect_t r, double elapsed,
         HDR_SEP();
         char drop_n[12]; fmt_rate(drop_n, sizeof(drop_n), (double)total_events_dropped);
         char drop_s[32]; snprintf(drop_s, sizeof(drop_s), " %s DROP:%s", WARN, drop_n);
-        col = vscreen_puts(row, col, drop_s, T->fg_red, T->bg_header_row, true, false);
+        /* FIX: bound to metric_end — unclipped vscreen_puts overwrote clock zone */
+        col = safe_puts(row, col, metric_end - col,
+                        drop_s, T->fg_red, T->bg_header_row, true, false);
     }
 
     (void)col;  /* metric stream ends here */
 
-    /* ── FIXED-WIDTH CLOCK at the right end of the metrics row ──
+    /*
+     * ── CLOCK — btop-style: HH:MM:SS centered on the TOP BORDER row ──
      *
-     * FIX — CLOCK CORRECTNESS:
-     * 1. Use localtime_r() instead of localtime() — re-entrant, no
-     *    stale pointer from a previous call.
-     * 2. Build the full "Day DD Mon  HH:MM:SS" string in ONE buffer
-     *    and pad/truncate to exactly CLOCK_W cells with safe_puts().
-     *    The old code wrote datebuf at clock_col and timebuf at
-     *    clock_col+9 — but strftime("%a %d %b") can be 9 OR 10 chars
-     *    (e.g. "Sat 18 Apr" = 10) so the time was written 1 col off.
-     * 3. Only update the display when the second changes — prevents
-     *    unnecessary cell diffs and potential visual flicker.
+     * btop renders the clock as a panel title ON THE BORDER LINE itself,
+     * centered at (x + width/2 - len/2), wrapped in title_left/title_right
+     * decorators (┤ HH:MM:SS ├).  It shows ONLY the time — no date.
+     *
+     * We replicate this exactly:
+     *   - Use strftime("%T") = "HH:MM:SS" (always 8 chars, POSIX)
+     *   - Compute center column on the top border row (r.row)
+     *   - Draw: T->bmr + " " + time + " " + T->bml (right-tee, time, left-tee)
+     *     using the header's double-line border chars (bdv,bdtl,bdtr already drawn)
+     *   - Only update when the second changes (diff engine handles no-op)
+     *
+     * WHY top border row (r.row), not metrics row (r.row+1):
+     *   The metrics row is already populated with left-stream text that may
+     *   collide.  The border row has only ═══ fill which is safe to overwrite
+     *   at any centered position — exactly what btop does.
      */
     {
         static time_t last_clock_sec = 0;
-        static char   clock_buf[CLOCK_W + 1] = "";
+        static char   clock_buf[9]   = "";   /* "HH:MM:SS\0" — always 8 chars */
 
-        time_t     now = time(NULL);
-        struct tm  tm_info;
+        time_t    now = time(NULL);
+        struct tm tm_info;
         localtime_r(&now, &tm_info);
 
         if (now != last_clock_sec) {
-            /*
-             * Target: "Sat 18 Apr  14:38:56" — exactly CLOCK_W=20 chars.
-             *
-             * "%a %d %b" always produces exactly 10 chars (strftime zero-pads
-             * the day with %d: "Sat 08 Apr").  Two spaces + "%H:%M:%S" (always
-             * 8 chars) = 10 + 2 + 8 = 20 = CLOCK_W exactly.
-             *
-             * We use snprintf with the full buffer size, then hard-clamp at
-             * CLOCK_W to guard against any locale weirdness.
-             */
-            char date_part[12], time_part[10];
-            strftime(date_part, sizeof(date_part), "%a %d %b", &tm_info);
-            strftime(time_part, sizeof(time_part), "%H:%M:%S",  &tm_info);
-            snprintf(clock_buf, sizeof(clock_buf),
-                     "%-10s  %8s", date_part, time_part);
-            clock_buf[CLOCK_W] = '\0';   /* hard clamp — always 20 */
+            strftime(clock_buf, sizeof(clock_buf), "%H:%M:%S", &tm_info);
             last_clock_sec = now;
         }
 
-        int clock_col = right_guard - CLOCK_W;
-        if (clock_col > r.col + 2) {
-            safe_puts(row, clock_col, CLOCK_W,
-                      clock_buf, T->fg_primary, T->bg_header_row, true, false);
+        /* Center the 8-char time string in the top border row.
+         * Layout: ┤ HH:MM:SS ├  — 1 space pad each side = 10 cells total.
+         * Placement mirrors btop: col = r.col + W/2 - (8+2)/2 = W/2 - 5    */
+        int center = r.col + W / 2;
+        int tl_col = center - 5;   /* left tee at center-5                  */
+        int tr_col = center + 5;   /* right tee at center+5 (= tl+10)       */
+        int border_row = r.row;    /* top border row — already has ═══ fill  */
+
+        if (tl_col > r.col + 1 && tr_col < r.col + W - 1) {
+            /* Left tee (┤), space, time string (8 chars), space, right tee (├) */
+            vscreen_put(border_row, tl_col,     T->bmr, T->border_dim, T->bg_header_row, false, false);
+            vscreen_put(border_row, tl_col + 1, " ",    T->fg_dim,     T->bg_header_row, false, false);
+            vscreen_puts(border_row, tl_col + 2, clock_buf, T->fg_primary, T->bg_header_row, true, false);
+            vscreen_put(border_row, tl_col + 10, " ",   T->fg_dim,     T->bg_header_row, false, false);
+            vscreen_put(border_row, tl_col + 11, T->bml, T->border_dim, T->bg_header_row, false, false);
         }
     }
 
@@ -902,7 +903,7 @@ static void draw_processes(rect_t panel)
         if (show_bar && col + COL_BAR + 1 <= right_guard) {
             safe_printf(hr, col, COL_BAR,
                         T->fg_secondary, T->bg_header_row, false, false,
-                        "%*s", COL_BAR, "RATE\xe2\x96\x84");
+                        "%*s", COL_BAR, "RATE");
             col += COL_BAR + 1;
         }
 
