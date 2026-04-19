@@ -23,16 +23,15 @@
 ---
 
 ## Table of Contents
-
-1. [Overview](#overview)
-2. [Project Motivation](#project-motivation)
-3. [Features](#features)
-4. [System Architecture](#system-architecture)
-5. [Prerequisites & Dependencies](#prerequisites--dependencies)
-6. [Installation & Setup](#installation--setup)
-7. [Build Instructions](#build-instructions)
-8. [Usage Guide](#usage-guide)
-9. [Configuration Options](#configuration-options)
+1. [Prerequisites & Dependencies](#prerequisites--dependencies)
+2. [Installation & Setup](#installation--setup)
+3. [Build Instructions](#build-instructions)
+4. [Usage Guide](#usage-guide)
+5. [Configuration Options](#configuration-options)
+6. [Overview](#overview)
+7. [Project Motivation](#project-motivation)
+8. [Features](#features)
+9. [System Architecture](#system-architecture)
 10. [Dashboard Interface](#dashboard-interface)
 11. [Export Formats](#export-formats)
 12. [Technical Implementation](#technical-implementation)
@@ -42,167 +41,6 @@
 16. [Future Enhancements](#future-enhancements)
 17. [License](#license)
 18. [Acknowledgments](#acknowledgments)
-
----
-
-## Overview
-
-**eBPF Kernel Monitor** is a real-time, kernel-level system performance monitoring tool that leverages Extended Berkeley Packet Filter (eBPF) technology to trace system calls, CPU scheduling events, and process lifecycle operations without modifying the Linux kernel.
-
-The tool provides:
-- **Zero-overhead kernel monitoring** through eBPF tracepoints
-- **Real-time performance metrics** with adaptive anomaly detection
-- **Interactive CLI dashboard** with live updates every 2 seconds
-- **Multiple export formats** (JSON, CSV, anomaly logs)
-- **Intelligent filtering** applied directly in kernel space
-- **Statistical analysis** including P95 latency histograms
-
-### Key Innovation
-
-Unlike traditional monitoring tools that rely on userspace polling or `/proc` filesystem parsing (which introduces significant overhead), our solution uses eBPF to attach directly to kernel tracepoints, capturing events at the source with minimal performance impact (typically < 3% CPU overhead even under heavy workloads).
-
----
-
-## Project Motivation
-
-Modern distributed systems and cloud-native applications require deep visibility into system behavior for:
-- **Performance debugging** — identifying bottlenecks in I/O operations
-- **Anomaly detection** — detecting unusual latency spikes or resource contention
-- **Capacity planning** — understanding system call patterns and resource utilization
-- **Security monitoring** — tracking process execution and file access patterns
-
-Traditional monitoring approaches have limitations:
-- **Kernel modules** require recompilation for each kernel version and can crash the system
-- **System tap/DTrace** have steep learning curves and platform dependencies  
-- **Userspace tools** (`strace`, `perf`) introduce 10-100× performance overhead
-
-**eBPF** solves these problems by:
-1. Running sandboxed programs in kernel space with safety guarantees
-2. Using CO-RE (Compile Once - Run Everywhere) for kernel portability
-3. Filtering data at the source before crossing kernel/userspace boundary
-4. Providing sub-microsecond precision event capture
-
----
-
-## ✨ Features
-
-### Core Capabilities
-
-- ✅ **Real-time Event Tracing**
-  - System calls: `openat`, `read`, `write`, `close`, `mmap`
-  - CPU scheduling: context switches and on/off-CPU time
-  - Process lifecycle: `exec`, `exit` events with runtime tracking
-
-- ✅ **Statistical Analysis**
-  - Average latency per (process, event) pair
-  - P95 latency via 8-bucket histogram
-  - Maximum latency tracking
-  - Event rate calculation (events/second)
-
-- ✅ **Adaptive Anomaly Detection**
-  - EMA (Exponential Moving Average) baseline per metric
-  - Configurable deviation thresholds (default: 50%)
-  - Real-time alerting on dashboard
-  - Continuous anomaly logging to file
-
-- ✅ **Kernel-space Filtering**
-  - Filter by process ID (`--pid`)
-  - Filter by process name (`--comm`)
-  - Minimum duration threshold (`--min-dur`)
-  - Filters compiled into BPF program for zero overhead
-
-- ✅ **Interactive Dashboard**
-  - 7-section layout with color-coded metrics
-  - Live updates every 2 seconds
-  - Keyboard controls (quit, reset, export)
-  - CPU overhead measurement and display
-
-- ✅ **Multiple Export Formats**
-  - JSON: Full snapshot with all metrics
-  - CSV: Flat format for analysis tools
-  - Anomaly logs: Timestamped deviation records
-
----
-
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         KERNEL SPACE (eBPF)                         │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    TRACEPOINT HOOKS                         │   │
-│  │  • sched_process_exec      (process execution)              │   │
-│  │  • sched_process_exit      (process termination)            │   │
-│  │  • sys_enter_openat        (file open entry)                │   │
-│  │  • sys_exit_openat         (file open exit)                 │   │
-│  │  • sys_enter/exit_read     (read syscall)                   │   │
-│  │  • sys_enter/exit_write    (write syscall)                  │   │
-│  │  • sys_enter/exit_close    (close syscall)                  │   │
-│  │  • sys_enter/exit_mmap     (memory map syscall)             │   │
-│  │  • sched/sched_switch      (CPU scheduling)                 │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              ↓                                      │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                   BPF FILTERING LOGIC                       │   │
-│  │  • PID filter (rodata: target_pid)                          │   │
-│  │  • Process name filter (rodata: target_comm[16])            │   │
-│  │  • Minimum duration filter (rodata: min_duration_ns)        │   │
-│  │  • Early rejection — unmatched events never reach userspace │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              ↓                                      │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │                    BPF HASH MAPS                            │   │
-│  │  • exec_start[pid]       → timestamp of exec entry          │   │
-│  │  • syscall_start[pid]    → timestamp of syscall entry       │   │
-│  │  • sched_start[pid]      → timestamp of CPU schedule-in     │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              ↓                                      │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │              RING BUFFER (256 KB)                           │   │
-│  │  • Low-latency kernel → userspace event delivery            │   │
-│  │  • In-order guarantee (vs perf buffer)                      │   │
-│  │  • Per-CPU buffering for scalability                        │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │ libbpf ring_buffer__poll()
-                             ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                         USER SPACE (C)                              │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
-│  │  bootstrap.c    │  │    stats.c       │  │  dashboard.c     │   │
-│  │                 │  │                  │  │                  │   │
-│  │ • Main loop     │→ │ • Aggregation    │→ │ • 7-section UI   │   │
-│  │ • CLI parsing   │  │ • EMA baseline   │  │ • Color coding   │   │
-│  │ • Ring buffer   │  │ • P95 histogram  │  │ • Sorting        │   │
-│  │   polling       │  │ • Anomaly detect │  │ • Refresh        │   │
-│  │ • CPU overhead  │  │ • 512 slot limit │  │ • Keyboard input │   │
-│  └─────────────────┘  └──────────────────┘  └──────────────────┘   │
-│                             ↓                                       │
-│                    ┌──────────────────┐                             │
-│                    │    export.c      │                             │
-│                    │                  │                             │
-│                    │ • JSON snapshot  │                             │
-│                    │ • CSV export     │                             │
-│                    │ • Anomaly log    │                             │
-│                    └──────────────────┘                             │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Flow
-
-1. **Kernel Events** → eBPF programs attached to tracepoints capture events
-2. **Filtering** → Filters applied via BPF rodata (constant propagation optimization)
-3. **Timestamp Capture** → Entry/exit timestamps stored in BPF hash maps
-4. **Ring Buffer** → Events submitted to 256KB ring buffer
-5. **Userspace Processing** → Poll ring buffer, aggregate statistics
-6. **Dashboard Rendering** → Update CLI every 2 seconds
-7. **Export** → On-demand or on-exit data serialization
 
 ---
 
@@ -247,7 +85,7 @@ which bpftool
 
 ---
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 ### Step 1: Install Dependencies
 
@@ -358,7 +196,7 @@ make clean
 
 ---
 
-## 📚 Usage Guide
+## Usage Guide
 
 ### Basic Usage
 
@@ -591,6 +429,169 @@ struct {
 
 For high-throughput systems, increase to `512 * 1024` or `1024 * 1024`.
 
+
+---
+
+## Overview
+
+**eBPF Kernel Monitor** is a real-time, kernel-level system performance monitoring tool that leverages Extended Berkeley Packet Filter (eBPF) technology to trace system calls, CPU scheduling events, and process lifecycle operations without modifying the Linux kernel.
+
+The tool provides:
+- **Zero-overhead kernel monitoring** through eBPF tracepoints
+- **Real-time performance metrics** with adaptive anomaly detection
+- **Interactive CLI dashboard** with live updates every 2 seconds
+- **Multiple export formats** (JSON, CSV, anomaly logs)
+- **Intelligent filtering** applied directly in kernel space
+- **Statistical analysis** including P95 latency histograms
+
+### Key Innovation
+
+Unlike traditional monitoring tools that rely on userspace polling or `/proc` filesystem parsing (which introduces significant overhead), our solution uses eBPF to attach directly to kernel tracepoints, capturing events at the source with minimal performance impact (typically < 3% CPU overhead even under heavy workloads).
+
+---
+
+## Project Motivation
+
+Modern distributed systems and cloud-native applications require deep visibility into system behavior for:
+- **Performance debugging** — identifying bottlenecks in I/O operations
+- **Anomaly detection** — detecting unusual latency spikes or resource contention
+- **Capacity planning** — understanding system call patterns and resource utilization
+- **Security monitoring** — tracking process execution and file access patterns
+
+Traditional monitoring approaches have limitations:
+- **Kernel modules** require recompilation for each kernel version and can crash the system
+- **System tap/DTrace** have steep learning curves and platform dependencies  
+- **Userspace tools** (`strace`, `perf`) introduce 10-100× performance overhead
+
+**eBPF** solves these problems by:
+1. Running sandboxed programs in kernel space with safety guarantees
+2. Using CO-RE (Compile Once - Run Everywhere) for kernel portability
+3. Filtering data at the source before crossing kernel/userspace boundary
+4. Providing sub-microsecond precision event capture
+
+---
+
+## Features
+
+### Core Capabilities
+
+- **Real-time Event Tracing**
+  - System calls: `openat`, `read`, `write`, `close`, `mmap`
+  - CPU scheduling: context switches and on/off-CPU time
+  - Process lifecycle: `exec`, `exit` events with runtime tracking
+
+- **Statistical Analysis**
+  - Average latency per (process, event) pair
+  - P95 latency via 8-bucket histogram
+  - Maximum latency tracking
+  - Event rate calculation (events/second)
+
+- **Adaptive Anomaly Detection**
+  - EMA (Exponential Moving Average) baseline per metric
+  - Configurable deviation thresholds (default: 50%)
+  - Real-time alerting on dashboard
+  - Continuous anomaly logging to file
+
+- **Kernel-space Filtering**
+  - Filter by process ID (`--pid`)
+  - Filter by process name (`--comm`)
+  - Minimum duration threshold (`--min-dur`)
+  - Filters compiled into BPF program for zero overhead
+
+- **Interactive Dashboard**
+  - 7-section layout with color-coded metrics
+  - Live updates every 2 seconds
+  - Keyboard controls (quit, reset, export)
+  - CPU overhead measurement and display
+
+- **Multiple Export Formats**
+  - JSON: Full snapshot with all metrics
+  - CSV: Flat format for analysis tools
+  - Anomaly logs: Timestamped deviation records
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         KERNEL SPACE (eBPF)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    TRACEPOINT HOOKS                         │   │
+│  │  • sched_process_exec      (process execution)              │   │
+│  │  • sched_process_exit      (process termination)            │   │
+│  │  • sys_enter_openat        (file open entry)                │   │
+│  │  • sys_exit_openat         (file open exit)                 │   │
+│  │  • sys_enter/exit_read     (read syscall)                   │   │
+│  │  • sys_enter/exit_write    (write syscall)                  │   │
+│  │  • sys_enter/exit_close    (close syscall)                  │   │
+│  │  • sys_enter/exit_mmap     (memory map syscall)             │   │
+│  │  • sched/sched_switch      (CPU scheduling)                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                   BPF FILTERING LOGIC                       │   │
+│  │  • PID filter (rodata: target_pid)                          │   │
+│  │  • Process name filter (rodata: target_comm[16])            │   │
+│  │  • Minimum duration filter (rodata: min_duration_ns)        │   │
+│  │  • Early rejection — unmatched events never reach userspace │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                    BPF HASH MAPS                            │   │
+│  │  • exec_start[pid]       → timestamp of exec entry          │   │
+│  │  • syscall_start[pid]    → timestamp of syscall entry       │   │
+│  │  • sched_start[pid]      → timestamp of CPU schedule-in     │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              ↓                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │              RING BUFFER (256 KB)                           │   │
+│  │  • Low-latency kernel → userspace event delivery            │   │
+│  │  • In-order guarantee (vs perf buffer)                      │   │
+│  │  • Per-CPU buffering for scalability                        │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ libbpf ring_buffer__poll()
+                             ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                         USER SPACE (C)                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
+│  │  bootstrap.c    │  │    stats.c       │  │  dashboard.c     │   │
+│  │                 │  │                  │  │                  │   │
+│  │ • Main loop     │→ │ • Aggregation    │→ │ • 7-section UI   │   │
+│  │ • CLI parsing   │  │ • EMA baseline   │  │ • Color coding   │   │
+│  │ • Ring buffer   │  │ • P95 histogram  │  │ • Sorting        │   │
+│  │   polling       │  │ • Anomaly detect │  │ • Refresh        │   │
+│  │ • CPU overhead  │  │ • 512 slot limit │  │ • Keyboard input │   │
+│  └─────────────────┘  └──────────────────┘  └──────────────────┘   │
+│                             ↓                                       │
+│                    ┌──────────────────┐                             │
+│                    │    export.c      │                             │
+│                    │                  │                             │
+│                    │ • JSON snapshot  │                             │
+│                    │ • CSV export     │                             │
+│                    │ • Anomaly log    │                             │
+│                    └──────────────────┘                             │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+1. **Kernel Events** → eBPF programs attached to tracepoints capture events
+2. **Filtering** → Filters applied via BPF rodata (constant propagation optimization)
+3. **Timestamp Capture** → Entry/exit timestamps stored in BPF hash maps
+4. **Ring Buffer** → Events submitted to 256KB ring buffer
+5. **Userspace Processing** → Poll ring buffer, aggregate statistics
+6. **Dashboard Rendering** → Update CLI every 2 seconds
+7. **Export** → On-demand or on-exit data serialization
+
+
 ---
 
 ## Dashboard Interface
@@ -702,7 +703,7 @@ Tracks process creation/termination.
 
 ---
 
-## 📤 Export Formats
+## Export Formats
 
 ### JSON Format
 
@@ -782,7 +783,7 @@ Continuous timestamped anomaly records:
 
 ---
 
-## 🛠️ Technical Implementation
+## Technical Implementation
 
 ### eBPF Program Architecture
 
@@ -959,7 +960,7 @@ Rationale:
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 ebpf-monitor-main/
@@ -1014,7 +1015,7 @@ ebpf-monitor-main/
 
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Build Errors
 
