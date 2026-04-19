@@ -92,8 +92,8 @@ which bpftool
 **On Ubuntu/Debian:**
 ```bash
 sudo apt update
-sudo apt install -y clang llvm libbpf-dev linux-tools-common \
-    linux-tools-$(uname -r) bpftool libelf-dev zlib1g-dev gcc make
+sudo apt install -y clang llvm libbpf-dev libelf-dev zlib1g-dev gcc make \
+    linux-tools-common linux-tools-$(uname -r)
 ```
 
 **On Fedora/RHEL:**
