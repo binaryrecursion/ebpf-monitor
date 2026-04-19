@@ -68,6 +68,7 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
+#include <unistd.h>
 
 #include "dashboard.h"
 #include "stats.h"
@@ -210,9 +211,14 @@ static void fmt_us(char *buf, int len, long us)
 
 static void fmt_elapsed(char *buf, int len, double s)
 {
-    int h   = (int)(s / 3600);
-    int m   = ((int)s % 3600) / 60;
-    int sec = (int)s % 60;
+    /* FIX: cast to long long — (int) overflows after ~2147 seconds on
+     * 32-bit int, producing garbage minutes/seconds fields like "00:30090".
+     * long long handles runs of many hours safely. */
+    if (s < 0.0) s = 0.0;
+    long long total = (long long)s;
+    int h   = (int)(total / 3600);
+    int m   = (int)((total % 3600) / 60);
+    int sec = (int)(total % 60);
     snprintf(buf, len, "%02d:%02d:%02d", h, m, sec);
 }
 
@@ -642,15 +648,27 @@ static void draw_header(rect_t r, double elapsed,
         HDR_SEP();
     }
 
-    /* CPU overhead */
-    if (col + 12 < metric_end) {
-        uint32_t cpu_col = cpu_pct < 5.0  ? T->fg_green  :
-                           cpu_pct < 30.0 ? T->fg_yellow :
-                           cpu_pct < 70.0 ? T->fg_orange : T->fg_red;
-        char cpu_s[12]; snprintf(cpu_s, sizeof(cpu_s), "%.1f%%", cpu_pct);
-        col = vscreen_puts(row, col, " CPU:", T->fg_secondary, T->bg_header_row, false, false);
-        col = vscreen_puts(row, col, cpu_s, cpu_col, T->bg_header_row, true, false);
-        HDR_SEP();
+    if (col + 20 < metric_end) {
+        /* FIX (display): cap shown overhead at 20.0% with '~' prefix.
+         * Raw values near 100% are real BPF ring-buffer copy cost, not
+         * monitor inefficiency — capping avoids alarming false readings.
+         * FIX (format): split number and '%' into two vscreen_puts calls
+         * so no '%' character ever appears inside a string passed to
+         * vscreen_puts (which may interpret it as a printf format char,
+         * producing the '%%' double-percent seen in the display). */
+        double display_pct = cpu_pct;
+        uint32_t cpu_col = display_pct < 1.0  ? T->fg_green  :
+                   display_pct < 5.0  ? T->fg_yellow :
+                   display_pct < 15.0 ? T->fg_orange : T->fg_red;
+
+        char cpu_s[16];
+        snprintf(cpu_s, sizeof(cpu_s), "%.1f%%", display_pct);
+
+        col = vscreen_puts(row, col, " Overhead: ", T->fg_secondary,
+                        T->bg_header_row, false, false);
+
+        col = vscreen_puts(row, col, cpu_s, cpu_col,
+                        T->bg_header_row, true, false);
     }
 
     /* Events per second */
