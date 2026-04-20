@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -8,20 +7,14 @@
 #include "vscreen.h"
 #include "term.h"
 
-/* ------------------------------------------------------------------ */
-/* Global state                                                         */
-/* ------------------------------------------------------------------ */
+
 
 vs_cell_t vs_next[VS_MAX_ROWS][VS_MAX_COLS];
 vs_cell_t vs_prev[VS_MAX_ROWS][VS_MAX_COLS];
 int       vs_rows = 24;
 int       vs_cols = 80;
 
-static bool g_invalidated = true;  /* force full redraw on first flush */
-
-/* ------------------------------------------------------------------ */
-/* Blank cell constant                                                 */
-/* ------------------------------------------------------------------ */
+static bool g_invalidated = true;  
 
 static const vs_cell_t BLANK = {
     .ch   = " ",
@@ -31,28 +24,17 @@ static const vs_cell_t BLANK = {
     .dim  = 0
 };
 
-/* ------------------------------------------------------------------ */
-/* vscreen_resize                                                      */
-/* ------------------------------------------------------------------ */
-
 void vscreen_resize(int rows, int cols)
 {
     if (rows > VS_MAX_ROWS) rows = VS_MAX_ROWS;
     if (cols > VS_MAX_COLS) cols = VS_MAX_COLS;
     vs_rows = rows;
     vs_cols = cols;
-    /*
-     * Invalidate prev so next flush redraws everything.
-     * 0xFF is a sentinel value that will never match a real cell,
-     * guaranteeing every cell is treated as changed on the next flush.
-     */
+
     memset(vs_prev, 0xff, sizeof(vs_prev));
     g_invalidated = true;
 }
 
-/* ------------------------------------------------------------------ */
-/* vscreen_clear                                                       */
-/* ------------------------------------------------------------------ */
 
 void vscreen_clear(void)
 {
@@ -61,19 +43,11 @@ void vscreen_clear(void)
             vs_next[r][c] = BLANK;
 }
 
-/* ------------------------------------------------------------------ */
-/* vscreen_invalidate                                                  */
-/* ------------------------------------------------------------------ */
-
 void vscreen_invalidate(void)
 {
     memset(vs_prev, 0xff, sizeof(vs_prev));
     g_invalidated = true;
 }
-
-/* ------------------------------------------------------------------ */
-/* vscreen_put                                                         */
-/* ------------------------------------------------------------------ */
 
 void vscreen_put(int row, int col,
                  const char *ch,
@@ -93,10 +67,6 @@ void vscreen_put(int row, int col,
     cell->bold = bold ? 1 : 0;
     cell->dim  = dim  ? 1 : 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* vscreen_puts                                                        */
-/* ------------------------------------------------------------------ */
 
 int vscreen_puts(int row, int col,
                  const char *str,
@@ -122,9 +92,6 @@ int vscreen_puts(int row, int col,
     return c;
 }
 
-/* ------------------------------------------------------------------ */
-/* vscreen_printf                                                      */
-/* ------------------------------------------------------------------ */
 
 int vscreen_printf(int row, int col,
                    uint32_t fg, uint32_t bg,
@@ -139,9 +106,6 @@ int vscreen_printf(int row, int col,
     return vscreen_puts(row, col, buf, fg, bg, bold, dim);
 }
 
-/* ------------------------------------------------------------------ */
-/* vscreen_hline / vscreen_vline                                       */
-/* ------------------------------------------------------------------ */
 
 void vscreen_hline(int row, int col, int len,
                    const char *ch,
@@ -159,15 +123,6 @@ void vscreen_vline(int row, int col, int len,
         vscreen_put(row + i, col, ch, fg, bg, false, false);
 }
 
-/* ------------------------------------------------------------------ */
-/* vscreen_flush — the diff engine                                     */
-/*                                                                     */
-/* FIX: When emitting a blank/space cell with bg=0 (terminal default) */
-/* we must still emit an explicit SGR reset so that any previously    */
-/* colored background on that cell is cleared. Without this, cells    */
-/* that transition from colored→blank still show the old background   */
-/* because the terminal's current SGR isn't reset before the space.   */
-/* ------------------------------------------------------------------ */
 
 void vscreen_flush(void)
 {
@@ -184,7 +139,7 @@ void vscreen_flush(void)
             const vs_cell_t *n = &vs_next[r][c];
             const vs_cell_t *p = &vs_prev[r][c];
 
-            /* Skip cells that haven't changed */
+         
             if (!g_invalidated &&
                 n->fg   == p->fg   &&
                 n->bg   == p->bg   &&
@@ -193,7 +148,6 @@ void vscreen_flush(void)
                 memcmp(n->ch, p->ch, 5) == 0)
                 continue;
 
-            /* Move cursor if needed */
             if (cur_row != r || cur_col != c) {
                 term_move(r, c);
                 cur_row    = r;
