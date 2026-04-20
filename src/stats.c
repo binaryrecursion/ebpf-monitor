@@ -8,11 +8,6 @@ struct syscall_stat stats[MAX_STATS];
 int  stat_count           = 0;
 long total_events_dropped = 0;
 
-/* ------------------------------------------------------------------ */
-/* Internal: find or create a stat slot for (process, event) pair     */
-/* Returns NULL if table is full (event counted as dropped).          */
-/* ------------------------------------------------------------------ */
-
 static struct syscall_stat *get_stat(const char *proc,
                                      const char *ev,
                                      int         pid)
@@ -37,9 +32,6 @@ static struct syscall_stat *get_stat(const char *proc,
     return s;
 }
 
-/* ------------------------------------------------------------------ */
-/* Internal: record a latency sample into the histogram               */
-/* ------------------------------------------------------------------ */
 
 static void hist_record(struct syscall_stat *s, long ns)
 {
@@ -53,13 +45,6 @@ static void hist_record(struct syscall_stat *s, long ns)
     s->lat_hist[LAT_BUCKETS - 1]++;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public: approximate P95 latency in microseconds                    */
-/*                                                                     */
-/* Interpolates within the bucket that contains the 95th percentile   */
-/* sample.  Returns -1 if there are fewer than 20 samples (P95 is     */
-/* not meaningful on tiny sample sizes).                               */
-/* ------------------------------------------------------------------ */
 
 long stats_p95_us(const struct syscall_stat *s)
 {
@@ -77,29 +62,21 @@ long stats_p95_us(const struct syscall_stat *s)
             long edge = lat_bucket_us[b] == (long)9e18
                         ? max_us
                         : lat_bucket_us[b];
-            /*
-             * Cap at max_latency: the bucket upper edge can exceed the
-             * actual observed maximum when all samples in this bucket
-             * happen to be well below the edge (e.g. all samples are
-             * 8ms but the bucket goes up to 10ms).  P95 must never
-             * exceed the real maximum latency.
-             */
+            
             return edge < max_us ? edge : max_us;
         }
     }
     return max_us;
 }
 
-/* ------------------------------------------------------------------ */
-/* Internal: EMA baseline update + anomaly classification             */
-/* ------------------------------------------------------------------ */
+
 
 static void update_baseline(struct syscall_stat *s)
 {
     if (s->count == 0)
         return;
 
-    /* Use valid (non-noise) sample count for average */
+   
     long valid = s->count - s->drop_count;
     if (valid <= 0 || s->total_latency <= 0)
         return;
@@ -126,21 +103,19 @@ static void update_baseline(struct syscall_stat *s)
     s->is_anomaly = (s->deviation > ANOMALY_THRESHOLD) ? 1 : 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public API                                                          */
-/* ------------------------------------------------------------------ */
+
 
 void stats_update(const struct event *e)
 {
-    /* Drop events with no meaningful label */
+   
     if (e->filename[0] == '\0')
         return;
 
-    /* Ignore the monitor binary itself */
+   
     if (strcmp(e->comm, "bootstrap") == 0)
         return;
 
-    /* ---------- PROCESS EXEC ---------- */
+    
     if (e->type == EVENT_EXEC) {
         struct syscall_stat *s = get_stat(e->comm, "exec", e->pid);
         if (!s) return;
@@ -151,7 +126,7 @@ void stats_update(const struct event *e)
         return;
     }
 
-    /* ---------- PROCESS EXIT (lifecycle duration) ---------- */
+    
     if (e->type == EVENT_EXIT) {
         struct syscall_stat *s = get_stat(e->comm, "lifecycle", e->pid);
         if (!s) return;
@@ -167,7 +142,7 @@ void stats_update(const struct event *e)
         return;
     }
 
-    /* ---------- SYSCALL EVENTS ---------- */
+ 
     if (e->type == EVENT_SYSCALL) {
         struct syscall_stat *s = get_stat(e->comm, e->filename, e->pid);
         if (!s) return;
@@ -181,18 +156,14 @@ void stats_update(const struct event *e)
         return;
     }
 
-    /* ---------- SCHED EVENTS ---------- */
+    
     if (e->type == EVENT_SCHED) {
         struct syscall_stat *s = get_stat(e->comm, "sched", e->pid);
         if (!s) return;
         s->pid = e->pid;
         s->ctx_switches++;
 
-        /*
-         * Filter out noise: off-CPU > 200ms is almost certainly sleep,
-         * not scheduling latency.  Count for rate, but exclude from
-         * latency average, histogram, and anomaly baseline.
-         */
+       
         if (e->duration_ns > SCHED_NOISE_NS) {
             s->drop_count++;
             s->count++;
