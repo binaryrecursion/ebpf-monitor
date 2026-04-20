@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -6,10 +5,6 @@
 #include "bootstrap.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
-
-/* ------------------------------------------------------------------ */
-/* Maps                                                                */
-/* ------------------------------------------------------------------ */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -37,36 +32,25 @@ struct {
 	__uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
 
-/* ------------------------------------------------------------------ */
-/* Rodata: tunable constants set from user space before load          */
-/* ------------------------------------------------------------------ */
 
 const volatile unsigned long long min_duration_ns = 0;
 
-/* Filter by PID: 0 = trace all */
 const volatile int target_pid = 0;
 
-/* Filter by comm name: empty string = trace all */
 const volatile char target_comm[TASK_COMM_LEN] = {};
 
-/* ------------------------------------------------------------------ */
-/* Process filter                                                      */
-/* Returns 1 if the current process should be traced, 0 to skip.     */
-/* ------------------------------------------------------------------ */
 
 static __always_inline int allow_process(void)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-	/* PID filter */
 	if (target_pid != 0 && (int)pid != target_pid)
 		return 0;
 
-	/* Comm filter */
 	if (target_comm[0] != '\0') {
 		char comm[TASK_COMM_LEN];
 		bpf_get_current_comm(&comm, sizeof(comm));
-		/* Manual strcmp — BPF verifier requires bounded loops */
+	
 		for (int i = 0; i < TASK_COMM_LEN; i++) {
 			if (comm[i] != target_comm[i])
 				return 0;
@@ -78,9 +62,6 @@ static __always_inline int allow_process(void)
 	return 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Helper: get parent PID of current task via CO-RE                   */
-/* ------------------------------------------------------------------ */
 
 static __always_inline u32 get_ppid(void)
 {
@@ -88,9 +69,7 @@ static __always_inline u32 get_ppid(void)
 	return BPF_CORE_READ(task, real_parent, tgid);
 }
 
-/* ------------------------------------------------------------------ */
-/* process exec                                                        */
-/* ------------------------------------------------------------------ */
+
 
 SEC("tp/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -128,9 +107,6 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* process exit                                                        */
-/* ------------------------------------------------------------------ */
 
 SEC("tp/sched/sched_process_exit")
 int handle_exit(struct trace_event_raw_sched_process_template *ctx)
@@ -179,9 +155,6 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* openat latency                                                      */
-/* ------------------------------------------------------------------ */
 
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_sys_enter_openat(struct trace_event_raw_sys_enter *ctx)
@@ -214,9 +187,7 @@ int handle_sys_exit_openat(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* read latency                                                        */
-/* ------------------------------------------------------------------ */
+
 
 SEC("tracepoint/syscalls/sys_enter_read")
 int handle_sys_enter_read(struct trace_event_raw_sys_enter *ctx)
@@ -249,9 +220,7 @@ int handle_sys_exit_read(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* write latency                                                       */
-/* ------------------------------------------------------------------ */
+
 
 SEC("tracepoint/syscalls/sys_enter_write")
 int handle_sys_enter_write(struct trace_event_raw_sys_enter *ctx)
@@ -284,9 +253,6 @@ int handle_sys_exit_write(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* close latency                                                       */
-/* ------------------------------------------------------------------ */
 
 SEC("tracepoint/syscalls/sys_enter_close")
 int handle_sys_enter_close(struct trace_event_raw_sys_enter *ctx)
@@ -319,9 +285,7 @@ int handle_sys_exit_close(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* mmap latency                                                        */
-/* ------------------------------------------------------------------ */
+
 
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int handle_sys_enter_mmap(struct trace_event_raw_sys_enter *ctx)
@@ -354,9 +318,7 @@ int handle_sys_exit_mmap(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* CPU scheduling delay                                               */
-/* ------------------------------------------------------------------ */
+
 
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
@@ -370,7 +332,7 @@ int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 	char comm[16];
 	bpf_probe_read_kernel_str(comm, sizeof(comm), ctx->next_comm);
 
-	/* Apply comm filter for sched events */
+	
 	if (target_comm[0] != '\0') {
 		for (int i = 0; i < TASK_COMM_LEN; i++) {
 			if (comm[i] != target_comm[i])
@@ -380,7 +342,6 @@ int handle_sched_switch(struct trace_event_raw_sched_switch *ctx)
 		}
 	}
 
-	/* Apply PID filter */
 	if (target_pid != 0 && (int)next_pid != target_pid)
 		goto skip_next;
 
