@@ -1,7 +1,6 @@
 #ifndef TERM_H
 #define TERM_H
 
-/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
 
 #include <stdio.h>
 #include <unistd.h>
@@ -10,9 +9,6 @@
 #include <sys/ioctl.h>
 #include <signal.h>
 
-/* ------------------------------------------------------------------ */
-/* Terminal size                                                        */
-/* ------------------------------------------------------------------ */
 
 typedef struct { int rows; int cols; } term_size_t;
 
@@ -24,29 +20,23 @@ static inline term_size_t term_get_size(void)
     return (term_size_t){ 24, 80 };  /* safe fallback */
 }
 
-/* ------------------------------------------------------------------ */
-/* Alternate screen + mouse                                            */
-/* ------------------------------------------------------------------ */
-
 static inline void term_enter_alt_screen(void)
 {
-    fputs("\033[?1049h"   /* enter alternate screen buffer */
-          "\033[?25l",    /* hide cursor                   */
+    fputs("\033[?1049h"  
+          "\033[?25l",    
           stdout);
     fflush(stdout);
 }
 
 static inline void term_leave_alt_screen(void)
 {
-    fputs("\033[?25h"     /* show cursor                   */
-          "\033[?1049l",  /* leave alternate screen buffer */
+    fputs("\033[?25h"
+          "\033[?1049l",  
           stdout);
     fflush(stdout);
 }
 
-/* ------------------------------------------------------------------ */
-/* Cursor movement (0-based row/col)                                   */
-/* ------------------------------------------------------------------ */
+
 
 static inline void term_move(int row, int col)
 {
@@ -58,9 +48,7 @@ static inline void term_clear_screen(void)
     fputs("\033[2J\033[H", stdout);
 }
 
-/* ------------------------------------------------------------------ */
-/* Raw / non-blocking stdin                                            */
-/* ------------------------------------------------------------------ */
+
 
 static struct termios _term_orig;
 
@@ -82,28 +70,22 @@ static inline void term_restore_raw(void)
     fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
 }
 
-/* Read one byte from stdin; returns -1 if no data available */
 static inline int term_read_key(void)
 {
     unsigned char c;
     return (read(STDIN_FILENO, &c, 1) == 1) ? (int)c : -1;
 }
 
-/* ------------------------------------------------------------------ */
-/* ANSI SGR helpers                                                    */
-/* ------------------------------------------------------------------ */
 
 #define TERM_RESET      "\033[0m"
 #define TERM_BOLD       "\033[1m"
 #define TERM_DIM        "\033[2m"
 
-/* 24-bit foreground: r,g,b each 0-255 */
 static inline void term_fg(unsigned r, unsigned g, unsigned b)
 {
     printf("\033[38;2;%u;%u;%um", r, g, b);
 }
 
-/* 24-bit background */
 static inline void term_bg(unsigned r, unsigned g, unsigned b)
 {
     printf("\033[48;2;%u;%u;%um", r, g, b);
@@ -111,4 +93,4 @@ static inline void term_bg(unsigned r, unsigned g, unsigned b)
 
 static inline void term_reset(void) { fputs(TERM_RESET, stdout); }
 
-#endif /* TERM_H */
+#endif 
