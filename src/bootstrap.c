@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -29,10 +28,6 @@
 
 #define LIGHTNING "⚡"
 
-/* ------------------------------------------------------------------ */
-/* CLI argument state                                                  */
-/* ------------------------------------------------------------------ */
-
 static struct env {
     bool  verbose;
     long  min_duration_ms;
@@ -41,7 +36,7 @@ static struct env {
     char *export_json;
     char *export_csv;
     char *log_anomalies;
-    int   theme;         /* 0=dark (default), 1=mocha */
+    int   theme;         
 } env = {
     .verbose         = false,
     .min_duration_ms = 0,
@@ -102,23 +97,17 @@ static const struct argp argp = {
     .doc     = argp_doc,
 };
 
-/* ------------------------------------------------------------------ */
-/* Globals                                                             */
-/* ------------------------------------------------------------------ */
+
 
 static volatile bool exiting = false;
 static time_t        start_time;
 
-/* FIX 2: monotonic clock start for accurate, drift-free elapsed time */
 static struct timespec start_mono;
 
 static int  active_pid                  = 0;
 static char active_comm[TASK_COMM_LEN]  = "";
 static long active_min_dur_ms           = 0;
 
-/* ------------------------------------------------------------------ */
-/* SIGWINCH — terminal resize                                          */
-/* ------------------------------------------------------------------ */
 
 static volatile bool resize_pending = false;
 
@@ -128,9 +117,7 @@ static void sig_winch(int sig)
     resize_pending = true;
 }
 
-/* ------------------------------------------------------------------ */
-/* CPU overhead measurement                                            */
-/* ------------------------------------------------------------------ */
+
 
 static struct rusage cpu_baseline;
 static time_t        cpu_wall_start;
@@ -141,42 +128,17 @@ static void cpu_baseline_reset(void)
 {
     getrusage(RUSAGE_SELF, &cpu_baseline);
     cpu_wall_start = time(NULL);
-    /* Signal cpu_overhead_pct() to discard its stale interval snapshot. */
+
     cpu_interval_reset_pending = true;
 }
 
-/*
- * cpu_overhead_pct — per-interval CPU usage of this process, single-core basis.
- *
- * SEMANTICS (matching btop++):
- *   btop shows CPU% as a fraction of ONE core, NOT of total system CPU.
- *   A process using one full core shows ~100%, regardless of how many cores
- *   exist.  This is the standard ps/top convention.
- *
- *   Formula: (delta_user + delta_sys) / delta_wall * 100
- *   No division by nproc — that would give system-wide fraction (wrong).
- *
- * WHY clock_gettime instead of time(NULL) for wall_s:
- *   time(NULL) has 1-second resolution.  When called every 2 render seconds,
- *   the delta is sometimes 1s and sometimes 2s depending on alignment with
- *   the clock tick.  A 1s wall_s against 2s of accumulated CPU gives 200%
- *   before the 100% clamp, making the display spike.  CLOCK_MONOTONIC gives
- *   microsecond resolution so wall_s is always accurate to the true interval.
- *
- * FIX 4: when wall_s < 0.5s (interval too short to be meaningful), return
- *   the last known smoothed value instead of 0.0 — prevents the display
- *   flashing to zero on forced redraws (resize, reset, key press).
- *
- * FIX 3: EMA alpha lowered from 0.2 → 0.1 to dampen startup transient
- *   spikes caused by libbpf initialisation cost.
- */
+
 static double cpu_overhead_pct(void)
 {
     static struct rusage    ru_prev     = {{0},{0}};
     static struct timespec  wall_prev   = {0, 0};
     static bool             initialized = false;
 
-    /* FIX 3+4: persistent EMA accumulator; returned on short intervals */
     static double smooth = 0.0;
 
     struct rusage   ru_now;
@@ -190,13 +152,13 @@ static double cpu_overhead_pct(void)
         wall_prev                  = wall_now;
         initialized                = true;
         cpu_interval_reset_pending = false;
-        return smooth;  /* FIX 4: hold last value, not hard-zero */
+        return smooth; 
     }
 
     double wall_s = (wall_now.tv_sec  - wall_prev.tv_sec)
                   + (wall_now.tv_nsec - wall_prev.tv_nsec) / 1e9;
 
-    /* FIX 4: interval too short — return last known smooth value, not 0 */
+  
     if (wall_s < 0.5) return smooth;
 
     double used_u =
@@ -206,17 +168,14 @@ static double cpu_overhead_pct(void)
         (double)(ru_now.ru_stime.tv_sec  - ru_prev.ru_stime.tv_sec)
       + (double)(ru_now.ru_stime.tv_usec - ru_prev.ru_stime.tv_usec) / 1e6;
 
-    /* Update snapshots for next call */
     ru_prev   = ru_now;
     wall_prev = wall_now;
 
-    /* Single-core fraction: matches btop's per-process CPU% convention.
-     * No nproc divisor — 100% = one full core consumed. */
     double pct = ((used_u + used_s) / wall_s) * 100.0;
 
     if (pct < 0.0) pct = 0.0;
 
-    /* FIX 3: alpha 0.1 (was 0.2) — gentler smoothing, dampens startup spike */
+  
     double alpha = 0.10;
     smooth = fmod((alpha * pct + (1.00 - alpha) * smooth),3.00);
     
@@ -224,9 +183,6 @@ static double cpu_overhead_pct(void)
     return smooth;
 }
 
-/* ------------------------------------------------------------------ */
-/* Cleanup on exit                                                     */
-/* ------------------------------------------------------------------ */
 
 static void cleanup_terminal(void)
 {
@@ -234,9 +190,7 @@ static void cleanup_terminal(void)
     term_restore_raw();
 }
 
-/* ------------------------------------------------------------------ */
-/* libbpf logging                                                      */
-/* ------------------------------------------------------------------ */
+
 
 static int libbpf_print_fn(enum libbpf_print_level level,
                             const char *format, va_list args)
@@ -245,19 +199,12 @@ static int libbpf_print_fn(enum libbpf_print_level level,
     return vfprintf(stderr, format, args);
 }
 
-/* ------------------------------------------------------------------ */
-/* Signal handler                                                      */
-/* ------------------------------------------------------------------ */
 
 static void sig_handler(int sig)
 {
     (void)sig;
     exiting = true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Ring buffer callback                                                */
-/* ------------------------------------------------------------------ */
 
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
@@ -266,14 +213,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Startup splash — written through vscreen, NOT via printf           */
-/*                                                                     */
-/* FIX: Previously the startup message used printf() directly into    */
-/* the alternate screen. That left text at cursor position (0,0) that */
-/* vs_prev never knew about, so the diff engine never cleared it.     */
-/* Now we write through vscreen so the first real render wipes it.    */
-/* ------------------------------------------------------------------ */
+
 
 static void draw_startup_splash(int active_pid_,
                                 const char *active_comm_,
@@ -312,9 +252,7 @@ static void draw_startup_splash(int active_pid_,
     vscreen_flush();
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+
 
 int main(int argc, char **argv)
 {
@@ -325,7 +263,7 @@ int main(int argc, char **argv)
     err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
     if (err) return err;
 
-    /* Apply theme */
+
     if (env.theme == 1)
         theme_set(&THEME_MOCHA);
     else
@@ -340,22 +278,19 @@ int main(int argc, char **argv)
     signal(SIGTERM,  sig_handler);
     signal(SIGWINCH, sig_winch);
 
-    /* Enter raw mode + alternate screen */
+
     term_setup_raw();
     term_enter_alt_screen();
     atexit(cleanup_terminal);
 
-    /* FIX: Show startup splash through vscreen (not printf) so the
-     * alternate screen is clean before the first real dashboard render.
-     * The first vscreen_flush() here sets vs_prev correctly, so the
-     * subsequent dashboard_render() diff will cleanly overwrite it. */
+    
     draw_startup_splash(active_pid, active_comm, active_min_dur_ms);
 
     struct rlimit rlim = { .rlim_cur = RLIM_INFINITY,
                            .rlim_max = RLIM_INFINITY };
     setrlimit(RLIMIT_MEMLOCK, &rlim);
 
-    /* ---- Open / Load / Attach BPF ---- */
+  
     skel = bootstrap_bpf__open();
     if (!skel) {
         term_leave_alt_screen();
@@ -390,69 +325,40 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* Baseline AFTER BPF setup so libbpf startup cost is excluded. */
+    
     cpu_baseline_reset();
 
-    /* FIX 2: record both wall time (for exports) and monotonic time
-     * (for accurate, drift-free elapsed display). */
     start_time = time(NULL);
     clock_gettime(CLOCK_MONOTONIC, &start_mono);
 
     export_open_anomaly_log(env.log_anomalies);
 
-    /* ----------------------------------------------------------------
-     * Main event loop
-     *
-     * Key fixes vs original:
-     *
-     * 1. resize_pending is checked FIRST each iteration, before key
-     *    input. This prevents a frame with wrong dimensions.
-     *
-     * 2. vscreen_resize() is called ONLY from this resize handler
-     *    (and once at startup in draw_startup_splash). dashboard_render
-     *    no longer calls vscreen_resize on every size change — that
-     *    caused a double-resize and flicker.
-     *
-     * 3. Setting last_render = 0 on any state-changing event (resize,
-     *    reset, key) forces an immediate redraw on the next iteration
-     *    instead of waiting up to 2 seconds. Makes the UI feel instant.
-     *
-     * 4. FIX 1: ring_buffer__poll timeout reduced to 200ms (was 500ms).
-     *    When poll returns 0 events (idle), nanosleep(1ms) yields the
-     *    CPU — prevents the busy-spin that caused fake 90-100% overhead.
-     * ---------------------------------------------------------------- */
-
-    time_t last_render = 0;  /* 0 = force first render immediately */
+    time_t last_render = 0;  
 
     while (!exiting) {
-        err = ring_buffer__poll(rb, 200 /* ms — FIX 1: was 500ms */);
+        err = ring_buffer__poll(rb, 200 );
         if (err == -EINTR) { err = 0; break; }
         if (err < 0) {
             fprintf(stderr, "Error polling ring buffer: %d\n", err);
             break;
         }
 
-        /* FIX 1: No events arrived in this 200ms window — yield 1ms to
-         * prevent busy-spinning when the system is truly idle.
-         * This is the primary fix for the 90-100% CPU overhead bug:
-         * on a quiet system, the process now sleeps ~201ms per iteration
-         * instead of looping as fast as the kernel can wake it. */
+       
         if (err == 0) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L /* 1ms */ };
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000L };
             nanosleep(&ts, NULL);
         }
 
-        /* ── FIX: Handle resize FIRST, before key processing ── */
+      
         if (resize_pending) {
             term_size_t sz = term_get_size();
-            /* vscreen_resize invalidates vs_prev → forces full repaint */
             vscreen_resize(sz.rows, sz.cols);
             vscreen_invalidate();
             resize_pending = false;
-            last_render = 0;  /* force immediate redraw at new size */
+            last_render = 0;  
         }
 
-        /* Non-blocking key read */
+       
         int key = term_read_key();
 
         if (key == 'q') {
@@ -461,12 +367,12 @@ int main(int argc, char **argv)
 
         if (key == 'r') {
             stats_reset();
-            /* FIX 2: reset both wall and monotonic clocks together */
+           
             start_time = time(NULL);
             clock_gettime(CLOCK_MONOTONIC, &start_mono);
             cpu_baseline_reset();
             vscreen_invalidate();
-            last_render = 0;  /* force immediate redraw */
+            last_render = 0; 
         }
 
         if (key == 'e') {
@@ -478,15 +384,14 @@ int main(int argc, char **argv)
             stats_compute_rates(elapsed);
             export_json(env.export_json, elapsed);
             export_csv(env.export_csv,   elapsed);
-            last_render = 0;  /* ADD THIS — forces immediate redraw as acknowledgement */
+            last_render = 0; 
         }
 
-        /* Render every 2 seconds, or immediately when last_render == 0 */
+      
         time_t  now = time(NULL);
 
         if (last_render == 0 || now - last_render >= 2) {
-            /* FIX 2: compute elapsed from CLOCK_MONOTONIC for stable,
-             * sub-second-accurate uptime with no tick-alignment stutter. */
+            
             struct timespec mono_now;
             clock_gettime(CLOCK_MONOTONIC, &mono_now);
             double elapsed = (mono_now.tv_sec  - start_mono.tv_sec)
@@ -501,7 +406,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Final export on exit */
+   
     {
         struct timespec mono_now;
         clock_gettime(CLOCK_MONOTONIC, &mono_now);
