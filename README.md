@@ -598,13 +598,13 @@ The dashboard refreshes every 2 seconds and consists of 7 sections:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ eBPF Monitor | Runtime: 02:34 | CPU: 1.23% | Slots: 45/512          │
+│ eBPF Monitor | Runtime: 02:34 | Overhead: 1.23% | Slots: 45/512          │
 │ Filters: pid=1234 comm=nginx min-dur=5ms                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Runtime**: Total elapsed time since startup
-- **CPU**: Overhead of this monitoring process (measured after BPF attach)
+- **Overhead**: Overhead of this monitoring process (measured after BPF attach)
 - **Slots**: Number of tracked (process, event) pairs out of maximum (512)
 - **Filters**: Active kernel-space filters
 
