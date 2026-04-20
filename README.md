@@ -8,22 +8,14 @@
 
 ### Team Members
 
-\begin{table}[h!]
-\centering
-\begin{tabular}{|l|c|l|}
-\hline
-\textbf{Name} & \textbf{Roll No.} & \textbf{Email} \\
-\hline
-Anbleurag Kishor Patil & 24114015 & anurag\_kp@cs.iitr.ac.in \\
-Prabhat Chandra Tiwari & 24114066 & prabhat\_ct@cs.iitr.ac.in \\
-Vaibhav Kumar & 24114103 & vaibhav\_k@cs.iitr.ac.in \\
-Samarth Maheshwari & 24114084 & samarth\_m@cs.iitr.ac.in \\
-Vishal Kumar Shaw & 24114105 & vishal\_ks@cs.iitr.ac.in \\
-Rishabh Gupta & 24114077 & rishabh\_g@cs.iitr.ac.in \\
-\hline
-\end{tabular}
-\caption{Student Details}
-\end{table}
+| Name                     | Roll No. | Email                     |
+|--------------------------|----------|---------------------------|
+| Anbleurag Kishor Patil  | 24114015 | anurag_kp@cs.iitr.ac.in  |
+| Prabhat Chandra Tiwari  | 24114066 | prabhat_ct@cs.iitr.ac.in |
+| Vaibhav Kumar           | 24114103 | vaibhav_k@cs.iitr.ac.in  |
+| Samarth Maheshwari      | 24114084 | samarth_m@cs.iitr.ac.in  |
+| Vishal Kumar Shaw       | 24114105 | vishal_ks@cs.iitr.ac.in  |
+| Rishabh Gupta           | 24114077 | rishabh_g@cs.iitr.ac.in  |
 
 ---
 
