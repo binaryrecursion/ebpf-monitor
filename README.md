@@ -1115,7 +1115,3 @@ ebpf-monitor-main/
 
 ---
 
-
-**Last Updated:** April 19, 2026  
-**Version:** 1.0  
-**Document Status:** Final Submission
