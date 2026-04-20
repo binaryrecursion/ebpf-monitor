@@ -1116,25 +1116,6 @@ ebpf-monitor-main/
 ---
 
 
-
-
-
-## References
-
-1. Gregg, B. (2019). *BPF Performance Tools: Linux System and Application Observability*. Addison-Wesley Professional.
-
-2. Linux Kernel Documentation. "BPF Documentation." https://www.kernel.org/doc/html/latest/bpf/
-
-3. Nakryiko, A. "BPF CO-RE (Compile Once – Run Everywhere)." https://nakryiko.com/posts/bpf-core-reference-guide/
-
-4. Starovoitov, A., & Nakryiko, A. "libbpf: the road to 1.0." Linux Plumbers Conference, 2021.
-
-5. McCanne, S., & Jacobson, V. (1993). "The BSD Packet Filter: A New Architecture for User-level Packet Capture." USENIX Winter Conference.
-
-6. Vieira, M. A., et al. (2020). "Fast Packet Processing with eBPF and XDP: Concepts, Code, Challenges, and Applications." ACM Computing Surveys.
-
----
-
 **Last Updated:** April 19, 2026  
 **Version:** 1.0  
 **Document Status:** Final Submission
