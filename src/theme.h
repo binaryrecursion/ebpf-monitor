@@ -5,24 +5,20 @@
 
 #define rgb(r, g, b) ((uint32_t)(((r) << 16) | ((g) << 8) | (b)))
 
-/* ------------------------------------------------------------------ */
-/* Theme struct                                                         */
-/* ------------------------------------------------------------------ */
+
 
 typedef struct {
-    /* Backgrounds */
-    uint32_t bg_panel;       /* panel interior + global fill background */
-    uint32_t bg_header_row;  /* table header row background            */
-    uint32_t bg_alt_row;     /* alternating row background             */
-    uint32_t bg_selected;    /* selected / focused row                 */
-    uint32_t bg_anom_row;    /* anomaly-flagged row tint               */
 
-    /* Text */
-    uint32_t fg_primary;     /* bright white — main content            */
-    uint32_t fg_secondary;   /* medium gray — labels, units            */
-    uint32_t fg_dim;         /* dark gray — decorations, borders       */
+    uint32_t bg_panel;       
+    uint32_t bg_header_row;  
+    uint32_t bg_alt_row;    
+    uint32_t bg_selected;   
+    uint32_t bg_anom_row;    
+    
+    uint32_t fg_primary;     
+    uint32_t fg_secondary;  
+    uint32_t fg_dim;         
 
-    /* Semantic */
     uint32_t fg_green;
     uint32_t fg_yellow;
     uint32_t fg_orange;
@@ -33,36 +29,30 @@ typedef struct {
     uint32_t fg_teal;
     uint32_t fg_purple;
 
-    /* Border */
-    uint32_t border_dim;     /* box-drawing chars                      */
-    uint32_t border_title;   /* panel title text                       */
-
-    /* Box-drawing characters (UTF-8 strings) */
-    const char *bh;          /* ─ horizontal                           */
-    const char *bv;          /* │ vertical                             */
-    const char *btl;         /* ┌ top-left                             */
-    const char *btr;         /* ┐ top-right                            */
-    const char *bbl;         /* └ bottom-left                          */
-    const char *bbr;         /* ┘ bottom-right                         */
-    const char *bml;         /* ├ mid-left (divider)                   */
-    const char *bmr;         /* ┤ mid-right                            */
-    const char *bdh;         /* ═ double horizontal (header)           */
-    const char *bdtl;        /* ╔ double top-left                      */
-    const char *bdtr;        /* ╗ double top-right                     */
-    const char *bdbl;        /* ╚ double bottom-left                   */
-    const char *bdbr;        /* ╝ double bottom-right                  */
-    const char *bdv;         /* ║ double vertical                      */
+    
+    uint32_t border_dim;     
+    uint32_t border_title;  
+  
+    const char *bh;         
+    const char *bv;         
+    const char *btl;         
+    const char *btr;        
+    const char *bbl;         
+    const char *bbr;         
+    const char *bml;         
+    const char *bmr;         
+    const char *bdh;        
+    const char *bdtl;       
+    const char *bdtr;        
+    const char *bdbl;       
+    const char *bdbr;        
+    const char *bdv;
 } theme_t;
 
-/* ------------------------------------------------------------------ */
-/* Built-in themes                                                      */
-/* ------------------------------------------------------------------ */
 
-extern const theme_t THEME_DARK;    /* default dark theme              */
-extern const theme_t THEME_MOCHA;   /* Catppuccin Mocha                */
-
-extern const theme_t *T;            /* active theme pointer            */
-
+extern const theme_t THEME_DARK;    
+extern const theme_t THEME_MOCHA;   
+extern const theme_t *T;            
 void theme_set(const theme_t *t);
 
 #endif /* THEME_H */
