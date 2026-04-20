@@ -1,7 +1,6 @@
 # eBPF Kernel Monitor
 
 **CSC 206 Software Engineering Project — Group 11**  
-**Submitted: April 21, 2026**
 
 ---
 
