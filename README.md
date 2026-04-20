@@ -18,7 +18,6 @@
 | Vishal Kumar Shaw | 24114105 | vishal.shaw@example.com | +91-XXXXXXXXXX | Testing, Documentation, Build System |
 | Rishabh Gupta | 24114077 | rishabh.gupta@example.com | +91-XXXXXXXXXX | Integration, Code Review, Performance Optimization |
 
-> **Note:** Please update email addresses and mobile numbers in the table above before final submission.
 
 ---
 
