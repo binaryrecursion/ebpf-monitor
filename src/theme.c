@@ -1,32 +1,22 @@
-/* SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause) */
+
 
 #include "theme.h"
 
-/* ------------------------------------------------------------------ */
-/* Dark theme (GitHub dark inspired)                                   */
-/*                                                                     */
-/* bg_panel is the most important value in the whole theme.            */
-/* It is used as the background for every cell in the terminal —      */
-/* including gaps, panel interiors, and empty rows.  Pick a colour    */
-/* that looks good as a full-screen canvas.                            */
-/*                                                                     */
-/* 0x0d1117 = GitHub dark default page background (near-black)        */
-/* ------------------------------------------------------------------ */
+
 
 const theme_t THEME_DARK = {
-    /* ── Backgrounds ── */
-    .bg_panel      = 0x0d1117,  /* global canvas + panel fill — GitHub dark   */
-    .bg_header_row = 0x161b22,  /* slightly lighter for header rows            */
-    .bg_alt_row    = 0x111820,  /* subtle stripe on odd data rows              */
-    .bg_selected   = 0x1f6feb,  /* selection highlight                         */
-    .bg_anom_row   = 0x1a0808,  /* very subtle red tint for anomaly rows       */
+    .bg_panel      = 0x0d1117,  
+    .bg_header_row = 0x161b22,  
+    .bg_alt_row    = 0x111820,  
+    .bg_selected   = 0x1f6feb,  
+    .bg_anom_row   = 0x1a0808,  
 
-    /* ── Text ── */
+
     .fg_primary    = rgb(0xe6, 0xed, 0xf3),
     .fg_secondary  = rgb(0x8b, 0x94, 0x9e),
     .fg_dim        = rgb(0x48, 0x4f, 0x58),
 
-    /* ── Semantic ── */
+
     .fg_green      = rgb(0x3f, 0xb9, 0x50),
     .fg_yellow     = rgb(0xe3, 0xb3, 0x41),
     .fg_orange     = rgb(0xf0, 0x88, 0x3e),
@@ -37,13 +27,13 @@ const theme_t THEME_DARK = {
     .fg_teal       = rgb(0x39, 0xd3, 0x53),
     .fg_purple     = rgb(0xbc, 0x8c, 0xff),
 
-    /* ── Borders ── */
+   
     .border_dim    = rgb(0x30, 0x36, 0x3d),
     .border_title  = rgb(0x8b, 0x94, 0x9e),
 
-    /* ── Single-line box drawing ── */
-    .bh  = "\xe2\x94\x80",   /* ─ */
-    .bv  = "\xe2\x94\x82",   /* │ */
+    
+    .bh  = "\xe2\x94\x80",  
+    .bv  = "\xe2\x94\x82",  
     .btl = "\xe2\x94\x8c",   /* ┌ */
     .btr = "\xe2\x94\x90",   /* ┐ */
     .bbl = "\xe2\x94\x94",   /* └ */
@@ -60,11 +50,6 @@ const theme_t THEME_DARK = {
     .bdv  = "\xe2\x95\x91",  /* ║ */
 };
 
-/* ------------------------------------------------------------------ */
-/* Catppuccin Mocha theme                                              */
-/*                                                                     */
-/* bg_panel = 0x1e1e2e (Catppuccin Mocha base)                        */
-/* ------------------------------------------------------------------ */
 
 const theme_t THEME_MOCHA = {
     /* ── Backgrounds ── */
@@ -90,11 +75,9 @@ const theme_t THEME_MOCHA = {
     .fg_teal       = rgb(0x94, 0xe2, 0xd5),  /* Mocha teal    */
     .fg_purple     = rgb(0xcb, 0xa6, 0xf7),  /* Mocha mauve   */
 
-    /* ── Borders ── */
     .border_dim    = rgb(0x31, 0x32, 0x44),  /* Mocha surface0 */
     .border_title  = rgb(0xa6, 0xad, 0xc8),
 
-    /* ── Single-line box drawing ── */
     .bh  = "\xe2\x94\x80",
     .bv  = "\xe2\x94\x82",
     .btl = "\xe2\x94\x8c",
@@ -104,7 +87,6 @@ const theme_t THEME_MOCHA = {
     .bml = "\xe2\x94\x9c",
     .bmr = "\xe2\x94\xa4",
 
-    /* ── Double-line (header banner) ── */
     .bdh  = "\xe2\x95\x90",
     .bdtl = "\xe2\x95\x94",
     .bdtr = "\xe2\x95\x97",
@@ -113,9 +95,7 @@ const theme_t THEME_MOCHA = {
     .bdv  = "\xe2\x95\x91",
 };
 
-/* ------------------------------------------------------------------ */
-/* Active theme                                                         */
-/* ------------------------------------------------------------------ */
+
 
 const theme_t *T = &THEME_DARK;
 
