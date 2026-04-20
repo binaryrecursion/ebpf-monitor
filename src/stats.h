@@ -4,9 +4,9 @@
 #include "bootstrap.h"
 
 
-#define MAX_STATS         512   /* max unique (process, event) slots   */
-#define ANOMALY_THRESHOLD 0.5   /* 50% deviation triggers anomaly      */
-#define BASELINE_ALPHA    0.2   /* EMA smoothing: 0=slow, 1=no memory  */
+#define MAX_STATS         512  
+#define ANOMALY_THRESHOLD 0.5   
+#define BASELINE_ALPHA    0.2  
 
 
 #define SCHED_NOISE_NS    (200ULL * 1000 * 1000)   /* 200 ms           */
