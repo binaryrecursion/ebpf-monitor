@@ -8,15 +8,14 @@
 
 ### Team Members
 
-| Name | Roll No. | Email | Mobile | Individual Contribution |
+| Name | Roll No. | Email |
 |------|----------|-------|--------|------------------------|
-| Anurag Kishor Patil | 24114015 | anurag.patil@example.com | +91- | BPF Kernel Programming, System Call Tracing |
-| Prabhat Chandra Tiwari | 24114066 | prabhat.tiwari@example.com | +91-XXXXXXXXXX | Dashboard UI, Terminal Rendering, Layout Design |
-| Vaibhav Kumar | 24114103 | vaibhav.kumar@example.com | +91-XXXXXXXXXX | Statistics Aggregation, P95 Histogram, Anomaly Detection |
-| Samarth Maheshwari | 24114084 | samarth.maheshwari@example.com | +91-XXXXXXXXXX | Export Modules (JSON/CSV), Data Serialization |
-| Vishal Kumar Shaw | 24114105 | vishal.shaw@example.com | +91-XXXXXXXXXX | Testing, Documentation, Build System |
-| Rishabh Gupta | 24114077 | rishabh.gupta@example.com | +91-XXXXXXXXXX | Integration, Code Review, Performance Optimization |
-
+| Anurag Kishor Patil | 24114015 | anurag_kp@cs.iitr.ac.in |
+| Prabhat Chandra Tiwari | 24114066 | prabhat_ct@cs.iitr.ac.in | 
+| Vaibhav Kumar | 24114103 | vaibhav_k@cs.iitr.ac.in | 
+| Samarth Maheshwari | 24114084 | samarth_m@cs.iitr.ac.in |
+| Vishal Kumar Shaw | 24114105 | vishal_ks@cs.iitr.ac.in | 
+| Rishabh Gupta | 24114077 | rishabh_g@cs.iitr.ac.in |
 
 ---
 
