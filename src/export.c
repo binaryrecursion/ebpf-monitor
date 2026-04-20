@@ -7,9 +7,6 @@
 
 static FILE *anomaly_log_fp = NULL;
 
-/* ------------------------------------------------------------------ */
-/* Anomaly log                                                         */
-/* ------------------------------------------------------------------ */
 
 void export_open_anomaly_log(const char *path)
 {
@@ -58,7 +55,7 @@ void export_log_anomalies(double elapsed)
 void export_close(void)
 {
     if (anomaly_log_fp) {
-        /* Write a session-end marker so the log is self-contained */
+    
         time_t now = time(NULL);
         char   ts[64];
         strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -69,9 +66,6 @@ void export_close(void)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* JSON snapshot                                                       */
-/* ------------------------------------------------------------------ */
 
 void export_json(const char *path, double elapsed)
 {
@@ -131,9 +125,7 @@ void export_json(const char *path, double elapsed)
     fprintf(stderr, "[export] JSON written to %s\n", path);
 }
 
-/* ------------------------------------------------------------------ */
-/* CSV snapshot                                                        */
-/* ------------------------------------------------------------------ */
+
 
 void export_csv(const char *path, double elapsed)
 {
