@@ -1309,52 +1309,9 @@ LC_NUMERIC=C sudo ./bootstrap --export-csv output.csv
 
 ---
 
-## License
 
-This project is developed as part of the CSC 206 Software Engineering course at IIT Roorkee.
 
-**Academic Use License**
 
-Copyright © 2026 Group 11 - IIT Roorkee
-
-Permission is granted to use, modify, and distribute this software for academic and educational purposes only, with proper attribution to the original authors.
-
-For commercial use or redistribution, please contact the authors.
-
----
-
-## Acknowledgments
-
-### Course Instructor
-- **Prof. [Instructor Name]** — CSC 206 Software Engineering, IIT Roorkee
-
-### Technical References
-- **Brendan Gregg** — eBPF tools and tracing expertise
-- **Andrii Nakryiko** — libbpf library and BPF CO-RE architecture
-- **Linux Kernel Documentation** — eBPF subsystem and tracepoints
-
-### Open Source Projects
-- **libbpf** — BPF library for userspace applications
-- **bpftool** — BPF program inspection and management
-- **BCC (BPF Compiler Collection)** — Inspiration for tracing workflows
-
-### Libraries & Tools
-- **LLVM/clang** — BPF compilation toolchain
-- **vmlinux.h** — Kernel type definitions via BTF
-
----
-
-## Contact Information
-
-For questions, issues, or collaboration inquiries:
-
-**Project Repository:** [GitHub Link - To Be Added]
-
-**Institution:** Indian Institute of Technology Roorkee  
-**Course:** CSC 206 - Software Engineering  
-**Academic Year:** 2025-2026
-
----
 
 ## References
 
