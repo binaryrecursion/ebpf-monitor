@@ -39,8 +39,7 @@
 14. [Troubleshooting](#troubleshooting)
 15. [Known Limitations](#known-limitations)
 16. [Future Enhancements](#future-enhancements)
-17. [License](#license)
-18. [Acknowledgments](#acknowledgments)
+
 
 ---
 
