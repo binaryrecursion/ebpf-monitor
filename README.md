@@ -10,12 +10,9 @@
 
 | Name                     | Roll No. | Email                     |
 |--------------------------|----------|---------------------------|
-| Anurag Kishor Patil  | 24114015 | anurag_kp@cs.iitr.ac.in  |
-| Prabhat Chandra Tiwari  | 24114066 | prabhat_ct@cs.iitr.ac.in |
 | Vaibhav Kumar           | 24114103 | vaibhav_k@cs.iitr.ac.in  |
 | Samarth Maheshwari      | 24114084 | samarth_m@cs.iitr.ac.in  |
 | Vishal Kumar Shaw       | 24114105 | vishal_ks@cs.iitr.ac.in  |
-| Rishabh Gupta           | 24114077 | rishabh_g@cs.iitr.ac.in  |
 
 ---
 
